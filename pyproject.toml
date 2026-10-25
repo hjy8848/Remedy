@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remedy"
+version = "0.1.0"
+description = "Autonomous experiment synthesis for recursive agent improvement"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "alfworld>=0.4.2",
+  "numpy>=1.24",
+  "peft>=0.12",
+  "PyYAML>=6.0",
+  "textworld[pddl]>=1.6.1",
+  "torch>=2.2",
+  "transformers>=4.45",
+]
+
+[project.optional-dependencies]
+verl = [
+  "verl @ git+https://github.com/HaozheZhang6/verl.git@9268aad322df93cc61e9c168d66d395256dbe87a",
+  "cachetools",
+  "TransferQueue==0.1.8",
+  "fastapi",
+  "uvicorn",
+]
+verl-gpu = [
+  "verl[vllm,gpu] @ git+https://github.com/HaozheZhang6/verl.git@9268aad322df93cc61e9c168d66d395256dbe87a",
+  "cachetools",
+  "TransferQueue==0.1.8",
+  "fastapi",
+  "uvicorn",
+]
+
+[project.scripts]
+remedy = "experiment_rsi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.package-data]
+experiment_rsi = ["*.yaml"]

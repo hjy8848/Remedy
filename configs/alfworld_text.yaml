@@ -1,0 +1,20 @@
+dataset:
+  data_path: "$ALFWORLD_DATA/json_2.1.1/train"
+  eval_id_data_path: "$ALFWORLD_DATA/json_2.1.1/valid_seen"
+  eval_ood_data_path: "$ALFWORLD_DATA/json_2.1.1/valid_unseen"
+  num_train_games: -1
+  num_eval_games: -1
+
+env:
+  type: AlfredTWEnv
+  domain_randomization: false
+  task_types: [1, 2, 3, 4, 5, 6]
+  goal_desc_human_anns_prob: 0.0
+  expert_type: handcoded
+
+general:
+  training_method: dagger
+
+dagger:
+  training:
+    max_nb_steps_per_episode: 50

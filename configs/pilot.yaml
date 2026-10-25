@@ -1,0 +1,38 @@
+model:
+  path: Qwen/Qwen2.5-1.5B-Instruct
+  revision: 989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+  device: cuda
+  dtype: float16
+  max_new_tokens: 256
+  temperature: 0.7
+  top_p: 0.9
+  lora:
+    r: 4
+    alpha: 8
+    dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+alfworld:
+  config_path: configs/alfworld_text.yaml
+  split: eval_in_distribution
+  game_file: null
+
+worker:
+  image: python:3.11-slim
+  timeout_seconds: 10
+  startup_timeout_seconds: 120
+
+run:
+  seed: 7
+  max_steps: 20
+
+training:
+  learning_rate: 0.00001
+  gradient_checkpointing: true
+  opsd_top_k: 32
+
+research:
+  candidates: 4
+  experiment_split: train
+  experiments_per_group: 2
+  edits_per_branch: 2

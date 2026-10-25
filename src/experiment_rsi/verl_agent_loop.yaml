@@ -1,0 +1,2 @@
+- name: rsi_research_replay
+  _target_: experiment_rsi.verl_agent_loop.ResearchReplayAgentLoop
