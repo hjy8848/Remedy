@@ -497,11 +497,36 @@ def explore_game(config, game_file, model, source_split, max_steps,
                             "{!r}".format(match.group(0))
                         )
                 if not 0 <= selected_index < len(available_commands):
-                    raise ValueError(
-                        "Proposer selected option {} from a list of {} commands".format(
-                            selection, len(available_commands)
-                        )
+                    correction = model.generate(
+                        messages + [
+                            {"role": "assistant", "content": selection},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "That option is outside the valid range. Choose one integer "
+                                    "from 1 to {} and output only that integer."
+                                ).format(len(available_commands)),
+                            },
+                        ],
+                        max_new_tokens=8,
+                        temperature=0.0,
+                        top_p=1.0,
                     )
+                    generations.append(correction)
+                    corrected_selection = correction["generated_text"].strip()
+                    if not re.fullmatch(r"\d+", corrected_selection):
+                        raise ValueError(
+                            "Proposer returned invalid option {!r} and its correction was {!r}"
+                            .format(selection, corrected_selection)
+                        )
+                    selected_index = int(corrected_selection) - 1
+                    if not 0 <= selected_index < len(available_commands):
+                        raise ValueError(
+                            "Proposer returned invalid option {!r} and its correction selected "
+                            "option {} from a list of {} commands".format(
+                                selection, corrected_selection, len(available_commands)
+                            )
+                        )
             action = available_commands[selected_index]
             result = env.step(action)
             actions.append(action)
