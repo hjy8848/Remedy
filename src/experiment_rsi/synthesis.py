@@ -471,39 +471,33 @@ def explore_game(config, game_file, model, source_split, max_steps,
                 ]
                 generation = model.generate(
                     messages,
-                    max_new_tokens=config["model"]["max_new_tokens"],
+                    max_new_tokens=8,
                     temperature=config["model"]["temperature"],
                     top_p=config["model"]["top_p"],
                 )
                 generations.append(generation)
                 selection = generation["generated_text"].strip()
+                selected_index = None
                 if re.fullmatch(r"\d+", selection):
                     selected_index = int(selection) - 1
                 else:
                     lines = [line.strip() for line in selection.splitlines() if line.strip()]
                     match = re.fullmatch(r"(\d+): (.+)", lines[-1]) if lines else None
-                    if not match:
-                        raise ValueError(
-                            "Proposer must end its response with an index or an exact numbered "
-                            "ALFWorld command; received {!r}".format(selection)
-                        )
-                    selected_index = int(match.group(1)) - 1
-                    if (
-                        not 0 <= selected_index < len(available_commands)
-                        or match.group(2) != available_commands[selected_index]
-                    ):
-                        raise ValueError(
-                            "Proposer's selected command does not match the current command list: "
-                            "{!r}".format(match.group(0))
-                        )
-                if not 0 <= selected_index < len(available_commands):
+                    if match:
+                        numbered_index = int(match.group(1)) - 1
+                        if (
+                            0 <= numbered_index < len(available_commands)
+                            and match.group(2) == available_commands[numbered_index]
+                        ):
+                            selected_index = numbered_index
+                if selected_index is None or not 0 <= selected_index < len(available_commands):
                     correction = model.generate(
                         messages + [
                             {"role": "assistant", "content": selection},
                             {
                                 "role": "user",
                                 "content": (
-                                    "That option is outside the valid range. Choose one integer "
+                                    "Your reply was not one valid action index. Choose one integer "
                                     "from 1 to {} and output only that integer."
                                 ).format(len(available_commands)),
                             },
