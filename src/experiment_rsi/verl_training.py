@@ -234,6 +234,7 @@ def train_with_verl(config, samples, out_dir, objective, adapter_path=None):
         max(len(s["prompt_ids"]) for s in samples), max(len(s["generated_ids"]) for s in samples),
         checkpoint_dir, objective,
     )
+    tracking = config.get("tracking", {})
     env = os.environ.copy()
     tag = hashlib.sha1(str(out_dir).encode()).hexdigest()[:8]
     env["RAY_TMPDIR"] = "/dev/shm/rmd-{}".format(tag)
