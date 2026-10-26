@@ -48,6 +48,11 @@ class SyntheticTask:
     custom_goal_text: str
     witness_actions: List[str]
     source_split: str
+    experiment_id: str = ""
+    hypothesis_id: str = ""
+    hypothesis: str = ""
+    feedback_refs: List[str] = field(default_factory=list)
+    diagnostic_target: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -197,6 +197,8 @@ def run_command(args):
         args.test_tasks,
         args.experiment_adapter,
         args.edit_adapter,
+        args.batches_per_period or config.get("research", {}).get("batches_per_period"),
+        args.ood_test_tasks,
     )
     print(json.dumps(result, ensure_ascii=False))
 
@@ -267,6 +269,8 @@ def main():
     run_parser.add_argument("--experiment-adapter")
     run_parser.add_argument("--edit-adapter")
     run_parser.add_argument("--test-tasks")
+    run_parser.add_argument("--ood-test-tasks")
+    run_parser.add_argument("--batches-per-period", type=int)
     run_parser.add_argument("--out", required=True)
     run_parser.set_defaults(handler=run_command)
 

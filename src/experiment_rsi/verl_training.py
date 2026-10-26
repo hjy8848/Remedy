@@ -92,6 +92,12 @@ def build_verl_overrides(config, dataset_path, model_path, teacher_path, adapter
     tracking = config.get("tracking", {})
     dtype = config["model"]["dtype"]
     model_dtype = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}[dtype]
+    if objective == "grpo":
+        trainer_gpus_per_node = config["training"].get("grpo_gpus_per_node", 1)
+        teacher_gpus_per_node = 0
+    else:
+        trainer_gpus_per_node = config["training"].get("opsd_actor_gpus_per_node", 1)
+        teacher_gpus_per_node = config["training"].get("opsd_teacher_gpus_per_node", 1)
     token_budget = prompt_length + response_length
     logger_backends = tracking.get("logger", ["console"])
     project_name = tracking.get("project_name", "remedy")
@@ -147,7 +153,7 @@ def build_verl_overrides(config, dataset_path, model_path, teacher_path, adapter
         "actor_rollout_ref.rollout.agent.agent_loop_config_path={}".format(
             Path(__file__).with_name("verl_agent_loop.yaml").resolve()),
         "trainer.use_v1=True",
-        "trainer.n_gpus_per_node=1",
+        "trainer.n_gpus_per_node={}".format(trainer_gpus_per_node),
         "trainer.nnodes=1",
         "trainer.total_epochs=1",
         "trainer.total_training_steps=1",
@@ -166,7 +172,7 @@ def build_verl_overrides(config, dataset_path, model_path, teacher_path, adapter
     if objective == "opsd":
         overrides += [
             "distillation.enabled=True",
-            "distillation.n_gpus_per_node=1",
+            "distillation.n_gpus_per_node={}".format(teacher_gpus_per_node),
             "distillation.nnodes=1",
             "distillation.teacher_key=data_source",
             "distillation.self_distillation=True",
@@ -275,10 +281,19 @@ def train_with_verl(config, samples, out_dir, objective, adapter_path=None):
         # PEFT initializes B to zero. A has zero gradient on the first step;
         # weight decay is disabled, so B measures this first update.
         change = sum(float(v.float().abs().sum()) for k, v in weights.items() if "lora_B" in k)
+    trainer_gpus_per_node = config["training"].get(
+        "grpo_gpus_per_node" if objective == "grpo" else "opsd_actor_gpus_per_node", 1
+    )
+    teacher_gpus_per_node = (
+        config["training"].get("opsd_teacher_gpus_per_node", 1)
+        if objective == "opsd" else 0
+    )
     summary = {
         "backend": "verl", "verl_commit": VERL_COMMIT, "objective": objective,
         "role": samples[0]["role"], "sample_count": len(samples),
         "group_count": len({s["group_id"] for s in samples}), "trainer_step": step,
+        "trainer_gpus_per_node": trainer_gpus_per_node,
+        "teacher_gpus_per_node": teacher_gpus_per_node,
         "trainable_parameter_count": sum(v.numel() for v in weights.values()),
         "trainable_parameter_l1_change": change, "parameter_update": change > 0,
         "run_id": tracking.get("run_id"), "period": tracking.get("period"),

@@ -1,0 +1,52 @@
+model:
+  path: /home/shenyl/hf/model/Qwen/Qwen2.5-1.5B-Instruct
+  revision: 989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+  device: cuda
+  dtype: bfloat16
+  max_new_tokens: 256
+  editor_max_new_tokens: 2048
+  temperature: 0.7
+  top_p: 0.9
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.0
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+alfworld:
+  config_path: configs/alfworld_text.yaml
+  split: eval_in_distribution
+  game_file: null
+
+worker:
+  image: python:3.11-slim
+  timeout_seconds: 10
+  startup_timeout_seconds: 120
+
+run:
+  seed: 7
+  max_steps: 40
+
+training:
+  learning_rate: 0.00001
+  gradient_checkpointing: true
+  opsd_top_k: 32
+  grpo_gpus_per_node: 2
+  opsd_actor_gpus_per_node: 1
+  opsd_teacher_gpus_per_node: 1
+
+research:
+  diagnostic_split: train
+  diagnostic_games_per_period: 10
+  experiment_split: train
+  experiments_per_group: 8
+  exploration_gpus_per_node: 2
+  edits_per_branch: 2
+  batches_per_period: 20
+  selection_seen_scenes: 15
+  reward_seen_scenes: 15
+
+tracking:
+  project_name: Remedy-Full-Combined
+  experiment_name: Remedy-Full-Combined
+  logger: [console, swanlab]

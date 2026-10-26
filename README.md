@@ -19,7 +19,7 @@
 
 实验策略 GRPO、编辑策略 GRPO 和编辑策略 OPSD 统一使用 VeRL PR [#6833](https://github.com/verl-project/verl/pull/6833) 的固定提交及 V1 trainer。Host 负责环境执行与奖励采集；`verl_training.py` 导出记录并调用原生 trainer，`verl_agent_loop.py` 原样回放 prompt/response token 和行为 log-probability。GRPO 每个数据行对应一个研究组，每个 session 对应一条完整研究轨迹，多次模型调用作为同一 session 的多个输出；VeRL 原生计算轨迹级组内优势。`verl_runtime.py` 保留每条轨迹内各次调用的权重，梯度、优化器、调度器和 checkpoint 都由 VeRL/FSDP 管理。项目不再维护独立的 GRPO 损失或优化器循环。
 
-OPSD 使用同一入口，通过 PR 的 chat-turn 特权反馈与 top-k forward-KL 更新编辑 LoRA；每个候选单独携带自己的 Host 反馈。已有 LoRA 会先合并为冻结 teacher 快照。GRPO 使用一张 NVIDIA GPU，OPSD 使用两张：actor/rollout 一张，teacher 一张。
+OPSD 使用同一入口，通过 PR 的 chat-turn 特权反馈与 top-k forward-KL 更新编辑 LoRA；每个候选单独携带自己的 Host 反馈。已有 LoRA 会先合并为冻结 teacher 快照。`pilot` 默认用一张 NVIDIA GPU 做 GRPO；`full_remedy.yaml` 将 Designer GRPO 配为两卡 VeRL/FSDP，Editor OPSD 则用一张 actor/rollout 卡和一张 teacher 卡。本次正式训练使用 zju-12 的物理 GPU 1、2。
 
 `configs/smoke.yaml` 固定使用 Qwen2.5-0.5B-Instruct，适合在 Apple Silicon/MPS 或普通 CPU 上采样；训练 smoke 仍需要 NVIDIA GPU 和 VeRL。`configs/pilot.yaml` 是 Linux/NVIDIA 起始配置：固定到 Qwen2.5-1.5B-Instruct revision，使用 FP16、rank-4 LoRA、梯度检查点、每组 2 个实验和每个分支 2 个修改；正式比较时增加独立任务和重复种子。
 
@@ -95,6 +95,22 @@ remedy run --config configs/pilot.yaml \
 ```
 
 `--method rl` 同时用 GRPO 更新实验和修改策略；`distill` 冻结实验策略、用 OPSD 更新修改策略；`combined` 用实验价值 GRPO 和修改反馈 OPSD。多个周期的自动演化已接通，M 自改尚未实现。
+
+正式 combined 主实验使用 `configs/full_remedy.yaml`，每周期包含多个在线批次：每批用当前 Designer 采集新的 8 条实验轨迹、生成两个证据分支的修改候选，然后分别执行一次 VeRL GRPO 和一次 VeRL OPSD 更新。一个周期内 Service 父版本固定；批内用该周期的任务块筛选候选，周期结束时再在完整 Selection 池上配对复核，确认下一周期的 Service。Selection、Reward、ID Test 和 OOD Test 按源场景分区，测试任务只用于首尾评价。任务池少于周期数时，只在自身角色池内轮转复用，绝不跨角色共享。先生成固定任务池，再启动训练：
+
+```bash
+python scripts/prepare_full_pools.py --config configs/full_remedy.yaml \
+  --out runs/full-pools
+python scripts/run_with_swanlab_netrc.py run --config configs/full_remedy.yaml \
+  --selection-pool runs/full-pools/selection/tasks.jsonl \
+  --reward-pool runs/full-pools/reward/tasks.jsonl \
+  --test-tasks runs/full-pools/id_test/tasks.jsonl \
+  --ood-test-tasks runs/full-pools/ood_test/tasks.jsonl \
+  --periods 10 --batches-per-period 20 --method combined \
+  --out runs/full-combined
+```
+
+启动脚本从服务器已有的 `~/.swanlab/.netrc` 读取凭据，并只把 `SWANLAB_API_KEY` 注入训练进程环境，不写入仓库。VeRL 将每次 Designer/Editor 更新分别记入 SwanLab；研究主运行还记录任务合成率、修改收益、Service 选择集成绩、环境交互量和测试集首尾差值。`progress.json` 与各批次的训练日志用于核对真实完成的 optimizer updates；中断或报错不会被记作完整实验。
 
 ## 设计边界
 

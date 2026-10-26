@@ -32,6 +32,8 @@ training:
   gradient_checkpointing: true
 
 research:
+  diagnostic_split: train
+  diagnostic_games_per_period: 10
   experiment_split: train
   experiments_per_group: 4
   edits_per_branch: 2
