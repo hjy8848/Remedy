@@ -235,6 +235,8 @@ def train_with_verl(config, samples, out_dir, objective, adapter_path=None):
         checkpoint_dir, objective,
     )
     tracking = config.get("tracking", {})
+    project_name = tracking.get("project_name", "remedy")
+    experiment_name = tracking.get("trainer_experiment_name", objective)
     env = os.environ.copy()
     tag = hashlib.sha1(str(out_dir).encode()).hexdigest()[:8]
     env["RAY_TMPDIR"] = "/dev/shm/rmd-{}".format(tag)
@@ -258,8 +260,14 @@ def train_with_verl(config, samples, out_dir, objective, adapter_path=None):
         ], stdout=log, stderr=subprocess.STDOUT, check=True)
     adapter_dir = export_dir / "lora_adapter"
     from safetensors.torch import load_file
+    import torch
 
     weights = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    non_finite = [name for name, value in weights.items() if not torch.isfinite(value).all()]
+    if non_finite:
+        raise RuntimeError(
+            "VeRL exported adapter contains non-finite weights: {}".format(non_finite[0])
+        )
     if adapter_path:
         before = load_file(str(Path(adapter_path) / "adapter_model.safetensors"))
         change = sum(float((v.float() - before[k].float()).abs().sum()) for k, v in weights.items())
