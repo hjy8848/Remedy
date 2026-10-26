@@ -471,7 +471,7 @@ def explore_game(config, game_file, model, source_split, max_steps,
                 ]
                 generation = model.generate(
                     messages,
-                    max_new_tokens=8,
+                    max_new_tokens=4,
                     temperature=config["model"]["temperature"],
                     top_p=config["model"]["top_p"],
                 )
@@ -482,14 +482,17 @@ def explore_game(config, game_file, model, source_split, max_steps,
                     selected_index = int(selection) - 1
                 else:
                     lines = [line.strip() for line in selection.splitlines() if line.strip()]
-                    match = re.fullmatch(r"(\d+): (.+)", lines[-1]) if lines else None
-                    if match:
-                        numbered_index = int(match.group(1)) - 1
-                        if (
-                            0 <= numbered_index < len(available_commands)
-                            and match.group(2) == available_commands[numbered_index]
-                        ):
-                            selected_index = numbered_index
+                    if lines and re.fullmatch(r"\d+", lines[0]):
+                        selected_index = int(lines[0]) - 1
+                    else:
+                        match = re.fullmatch(r"(\d+): (.+)", lines[-1]) if lines else None
+                        if match:
+                            numbered_index = int(match.group(1)) - 1
+                            if (
+                                0 <= numbered_index < len(available_commands)
+                                and match.group(2) == available_commands[numbered_index]
+                            ):
+                                selected_index = numbered_index
                 if selected_index is None or not 0 <= selected_index < len(available_commands):
                     correction = model.generate(
                         messages + [
