@@ -36,6 +36,8 @@ for line in sys.stdin:
             result = program(request["view"], request["state"])
         if not isinstance(result, dict) or "kind" not in result or "state" not in result:
             raise TypeError("step must return a mapping with kind and state")
+        if not isinstance(result["state"], dict):
+            raise TypeError("step state must be a JSON object")
         if result["kind"] == "action":
             if set(result) != {"kind", "action", "state"} or not isinstance(result["action"], str):
                 raise TypeError("action result must contain kind, action, and state text")

@@ -33,8 +33,12 @@ def candidate_messages(parent, diagnostic_report):
                 "You improve an ALFWorld agent's execution policy. Use the supplied evidence to "
                 "return one complete JSON object with exactly two keys: policy_source (Python "
                 "source defining step(view, state)) and knowledge (array of short strings). "
-                "The step function must return either {kind: action, action: text, state: JSON} "
-                "or {kind: model, messages: chat messages, state: JSON}. view has objective, "
+                "The step function must return either {kind: action, action: text, state: object} "
+                "or {kind: model, messages: chat messages, state: object}. state must be a JSON object. "
+                "For an action directive, "
+                "action must exactly match one string in view['admissible_commands']; never return "
+                "a number or index. For a model directive that requests a numbered choice, include "
+                "the ordered command strings in state['action_choices']. view has objective, "
                 "observation, history, admissible_commands, knowledge, and remaining_steps. "
                 "The worker has only the Python standard library and no network. Do not include markdown."
             ),
@@ -69,8 +73,12 @@ def branch_messages(parent, experiment, diagnostic_report):
                 "Improve the ALFWorld execution policy using this experiment context. "
                 "Return one complete JSON object with exactly two keys: policy_source (Python "
                 "source defining step(view, state)) and knowledge (array of short strings). "
-                "The step function must return either an action directive or a model directive "
-                "with chat messages. view has objective, observation, history, admissible_commands, "
+                "The step function must return either {kind: action, action: text, state: object} "
+                "or {kind: model, messages: chat messages, state: object}. state must be a JSON object. "
+                "For an action directive, "
+                "action must exactly match one string in view['admissible_commands']; never return "
+                "a number or index. For a model directive that requests a numbered choice, include "
+                "the ordered command strings in state['action_choices']. view has objective, observation, history, admissible_commands, "
                 "knowledge, and remaining_steps. The worker has only the Python standard library "
                 "and no network. Do not include markdown."
             ),
@@ -339,6 +347,7 @@ def experiment_group(config, selection_path, reward_path, out_dir, parent_path,
             candidate_executable = not any(
                 result["candidate_error"] for result in selection_results + reward_results
             )
+        item["candidate_executable"] = candidate_executable
         reward_delta = reward_task_score - parent_reward_task_score
         gains = visible_gains if item["branch"] == "with_evidence" else masked_gains
         gains[item["experiment_id"]].append(reward_delta)

@@ -32,7 +32,7 @@ def task_progress(task, facts):
     return completed, (completed + 0.5 * partial) / len(task.goal_atoms)
 
 
-def resolve_model_action(selection, admissible_commands, action_choices):
+def resolve_action(selection, admissible_commands, action_choices):
     if selection in admissible_commands:
         return selection
     if re.fullmatch(r"\d+", selection):
@@ -92,13 +92,23 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                     temperature=config["model"]["temperature"],
                     top_p=config["model"]["top_p"],
                 )
-                action = resolve_model_action(
-                    generation["generated_text"].strip(),
-                    view["admissible_commands"],
-                    policy_state.get("action_choices", view["admissible_commands"]),
-                )
+                selection = generation["generated_text"].strip()
             else:
-                action = directive["action"]
+                selection = directive["action"].strip()
+            action_choices = policy_state.get("action_choices", view["admissible_commands"])
+            if not isinstance(action_choices, list) or not all(
+                isinstance(choice, str) for choice in action_choices
+            ):
+                candidate_error = "policy state action_choices must be a list of command strings"
+                break
+            action = resolve_action(
+                selection,
+                view["admissible_commands"],
+                action_choices,
+            )
+            if action not in view["admissible_commands"]:
+                candidate_error = "policy action is not an admissible command"
+                break
             result = env.step(action)
             if task:
                 completed_goal_atoms, task_reward = task_progress(task, result["facts"])
