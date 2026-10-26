@@ -101,13 +101,16 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
             ):
                 candidate_error = "policy state action_choices must be a list of command strings"
                 break
+            if directive["kind"] == "model" and re.fullmatch(r"\d+", selection) and not action_choices:
+                candidate_error = "numbered model output cannot be resolved because action_choices is empty"
+                break
             action = resolve_action(
                 selection,
                 view["admissible_commands"],
                 action_choices,
             )
             if action not in view["admissible_commands"]:
-                candidate_error = "policy action is not an admissible command"
+                candidate_error = "policy action {!r} is not an admissible command".format(selection)
                 break
             result = env.step(action)
             if task:
