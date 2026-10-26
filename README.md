@@ -15,26 +15,29 @@
 
 ## 安装
 
-需要 Python 3.10+、Docker。Linux/NVIDIA GPU 用于正式 VeRL/vLLM 训练；Apple Silicon 可以安装依赖并用 MPS 做小规模流程调试，但不能运行 VeRL 的 CUDA/vLLM trainer。
+需要 Python 3.11+、Docker。Linux/NVIDIA GPU 用于正式 VeRL/vLLM 训练；Apple Silicon 可以安装依赖并用 MPS 做采样与环境流程调试；训练由 Linux/NVIDIA 上的 VeRL 执行。
 
-编辑策略的 OPSD 训练使用 VeRL PR [#6833](https://github.com/verl-project/verl/pull/6833) 的原生 trainer：Host 在 ALFWorld 中执行候选并收集反馈，Replay AgentLoop 将原始 prompt、response token 和行为 log-probability 交给 VeRL；VeRL 冻结同一策略的 teacher，用 PR 提供的 chat-turn 特权上下文和 token 对齐计算 top-k forward-KL，再由 FSDP 更新 LoRA。已有 LoRA 会先合并成 teacher 快照，确保教师包含采样策略的当前权重。每个 OPSD 更新使用两张 NVIDIA GPU：一张给 actor/rollout，一张给 teacher。实验策略的 GRPO 目前仍由项目内的 PyTorch 循环更新。
+实验策略 GRPO、编辑策略 GRPO 和编辑策略 OPSD 统一使用 VeRL PR [#6833](https://github.com/verl-project/verl/pull/6833) 的固定提交及 V1 trainer。Host 负责环境执行与奖励采集；`verl_training.py` 导出记录并调用原生 trainer，`verl_agent_loop.py` 原样回放 prompt/response token 和行为 log-probability。GRPO 每个数据行对应一个研究组，每个 session 对应一条完整研究轨迹，多次模型调用作为同一 session 的多个输出；VeRL 原生计算轨迹级组内优势。`verl_runtime.py` 保留每条轨迹内各次调用的权重，梯度、优化器、调度器和 checkpoint 都由 VeRL/FSDP 管理。项目不再维护独立的 GRPO 损失或优化器循环。
 
-`configs/smoke.yaml` 固定使用 Qwen2.5-0.5B-Instruct，适合先在 Apple Silicon/MPS 或普通 CPU 上跑生成与 LoRA smoke。`configs/pilot.yaml` 是 Linux/NVIDIA 起始配置：固定到 Qwen2.5-1.5B-Instruct revision，使用 FP16、rank-4 LoRA、梯度检查点、每组 2 个实验和每个分支 2 个修改；正式比较时增加独立任务和重复种子。
+OPSD 使用同一入口，通过 PR 的 chat-turn 特权反馈与 top-k forward-KL 更新编辑 LoRA；每个候选单独携带自己的 Host 反馈。已有 LoRA 会先合并为冻结 teacher 快照。GRPO 使用一张 NVIDIA GPU，OPSD 使用两张：actor/rollout 一张，teacher 一张。
+
+`configs/smoke.yaml` 固定使用 Qwen2.5-0.5B-Instruct，适合在 Apple Silicon/MPS 或普通 CPU 上采样；训练 smoke 仍需要 NVIDIA GPU 和 VeRL。`configs/pilot.yaml` 是 Linux/NVIDIA 起始配置：固定到 Qwen2.5-1.5B-Instruct revision，使用 FP16、rank-4 LoRA、梯度检查点、每组 2 个实验和每个分支 2 个修改；正式比较时增加独立任务和重复种子。
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
-# MPS / sample collection; choose this or the GPU extra below
+# Apple Silicon/CPU sampling and config inspection
 python -m pip install -e '.[verl]'
-# Linux with NVIDIA GPUs / native VeRL OPSD: use this instead of .[verl]
+# Linux/NVIDIA: use the CUDA 12.8 PyTorch wheel, then install the pinned trainer stack
+# python -m pip install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 \
+#   --index-url https://download.pytorch.org/whl/cu128
 # python -m pip install -e '.[verl-gpu]'
 export ALFWORLD_DATA="$HOME/.cache/alfworld"
 alfworld-download --data-dir "$ALFWORLD_DATA"
 docker pull python:3.11-slim
 ```
 
-`.[verl]` 固定安装 PR #6833 对应的 VeRL commit，并带上该 trainer 实际导入的缓存、TransferQueue 与服务依赖。Linux/NVIDIA 机器运行原生 OPSD 时安装 `.[verl-gpu]`。当前 Apple Silicon 环境可生成研究样本，但 MPS 不支持 VeRL 的 CUDA/FSDP/vLLM trainer。
+`.[verl]` 固定安装 PR #6833 对应的 VeRL commit，并带上该 trainer 实际导入的缓存、TransferQueue 与服务依赖。`.[verl-gpu]` 固定 PyTorch 2.8.0+cu128、vLLM 0.11.0、torchvision 0.23.0+cu128、torchaudio 2.8.0+cu128、xFormers 0.0.32.post1，以及 vLLM 0.11.0 测试锁定的 Transformers 4.55.2、Tokenizers 0.21.1、Hugging Face Hub 0.34.3。VeRL 使用同一提交的 V1 trainer。vLLM 0.11 已移除 V0 engine，因此与 `trainer.use_v1=True` 对齐，不需要运行时兼容改写。当前 Apple Silicon 环境可生成研究样本，但 MPS 不支持 VeRL 的 CUDA/FSDP/vLLM trainer。
 
 ALFWorld 下载文本游戏和 PDDL 数据后，设置 `ALFWORLD_DATA` 指向数据根目录；`configs/alfworld_text.yaml` 使用官方数据目录结构。smoke 配置中的模型 revision 已固定，pilot 配置需要填写可访问的模型路径。配置不自动替换缺失的模型、数据或运行设备。
 
@@ -46,7 +49,7 @@ remedy model-smoke --config configs/smoke.yaml --out runs/p0-model
 remedy train-smoke --config configs/smoke.yaml --out runs/p0-train
 ```
 
-`train-smoke` 用模型真实生成的 token 做一次 LoRA 语言模型更新，记录可训练参数变化，保存适配器，再从基础模型重新加载适配器并生成一次。它只验证训练链路，不是算法实验结果。
+`train-smoke` 采集两条真实生成，用长度奖励运行一次原生 VeRL GRPO，导出 LoRA 并从基础模型重新加载生成。长度奖励只用于验证训练链路；研究实验使用 ALFWorld 的真实评价奖励。
 
 ## 当前研究闭环
 
@@ -65,8 +68,8 @@ remedy train --config configs/smoke.yaml --role edit --objective opsd \
   --run runs/group-0 --out runs/edit-opsd-update
 remedy research-group --config configs/smoke.yaml \
   --parent runs/group-0/service.json \
-  --experiment-adapter runs/experiment-update/adapter \
-  --edit-adapter runs/edit-opsd-update/adapter \
+  --experiment-adapter runs/experiment-update/adapter_export/lora_adapter \
+  --edit-adapter runs/edit-opsd-update/adapter_export/lora_adapter \
   --selection-tasks runs/selection/tasks.jsonl \
   --reward-tasks runs/reward/tasks.jsonl \
   --out runs/group-1
@@ -101,3 +104,9 @@ remedy run --config configs/pilot.yaml \
 - 环境/模型/磁盘/训练错误会让命令失败；任务未完成才是算法分数 0。
 
 数据来自 Hugging Face 上固定 revision 的 ALFWorld 原始游戏归档镜像，归档 SHA-256 已核对。本机已完成 ALFWorld reset/step、模型生成和一次 MPS LoRA smoke；硬件与更完整训练的限制见上方状态。
+
+## 实验室服务器训练环境
+
+服务器训练环境使用 `/home/hejingyu/projects/Remedy/.venv-verl-cu128/bin/python`（Python 3.11），独立安装 PyTorch 2.8.0+cu128 与 vLLM 0.11.0，并安装固定 VeRL commit 和 Remedy。它不继承或改写 ROSA 共享环境的 PyTorch/vLLM 包。旧 `.venv-verl` 继承 PyTorch 2.7.1+cu128、vLLM 0.10.0，只保留用于复现此前失败日志；旧 `.venv` 是 Python 3.10，无法导入当前 VeRL 的 `StrEnum` 路径。
+
+每次更新保存 `samples.parquet`、完整 `trainer.log`、VeRL checkpoint、`adapter_export/lora_adapter` 和 `train.json`。`train.json` 仅在 trainer、checkpoint 和 adapter 导出均成功后生成；失败查看同目录日志。新 adapter 的首步参数变化使用初始为零的 LoRA B 权重核对，继续训练则与传入 adapter 比较。

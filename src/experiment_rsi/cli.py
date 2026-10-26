@@ -64,82 +64,37 @@ def model_smoke(args):
 
 def train_smoke(args):
     from .config import load_config
+    from .model import ModelSession, seed_everything
+    from .verl_training import train_with_verl
 
     config = load_config(args.config)
-    import torch
-    import torch.nn.functional as F
-    from .model import ModelSession
-
-    torch.manual_seed(config["run"]["seed"])
-    random.seed(config["run"]["seed"])
-    session = ModelSession(config, trainable=True)
-    messages = [{"role": "user", "content": "Reply with a short useful sentence."}]
-    sample = session.generate(
-        messages,
-        max_new_tokens=min(32, config["model"]["max_new_tokens"]),
-        temperature=config["model"]["temperature"],
-        top_p=config["model"]["top_p"],
+    session = ModelSession(config)
+    messages = [{"role": "user", "content": "Write one short useful sentence."}]
+    samples = []
+    for index in range(2):
+        seed_everything(config["run"]["seed"] + index, session.torch)
+        generation = session.generate(
+            messages, max_new_tokens=32, temperature=config["model"]["temperature"],
+            top_p=config["model"]["top_p"],
+        )
+        samples.append({
+            **generation, "role": "experiment", "group_id": "runtime-smoke",
+            "training_eligible": True,
+            # Length reward exercises GRPO plumbing, not ALFWorld research quality.
+            "reward": float(len(generation["generated_ids"])),
+            "task_metrics": {"trajectory_id": str(index), "sample_weight": 1.0,
+                             "prompt_messages": messages},
+        })
+    del session
+    result = train_with_verl(config, samples, args.out, "grpo")
+    reloaded = ModelSession(config, adapter_path=result["adapter"])
+    result["reload_generation"] = reloaded.generate(
+        messages, max_new_tokens=16, temperature=0.0, top_p=1.0,
     )
-    prompt_ids = torch.tensor([sample["prompt_ids"]], device=session.device)
-    completion_ids = torch.tensor([sample["generated_ids"]], device=session.device)
-    input_ids = torch.cat((prompt_ids, completion_ids), dim=1)
-    labels = input_ids.clone()
-    labels[:, :prompt_ids.shape[1]] = -100
-
-    trainable = [(name, parameter) for name, parameter in session.model.named_parameters() if parameter.requires_grad]
-    if not trainable:
-        raise RuntimeError("LoRA setup produced no trainable parameters")
-    before = [(name, parameter.detach().clone()) for name, parameter in trainable]
-    if any("lora_" not in name for name, _ in trainable):
-        raise RuntimeError("only LoRA parameters may be trainable")
-
-    session.model.train()
-    optimizer = torch.optim.AdamW(
-        [parameter for _, parameter in trainable],
-        lr=config["training"]["learning_rate"],
-        weight_decay=0.0,
-    )
-    optimizer.zero_grad(set_to_none=True)
-    logits = session.model(input_ids=input_ids).logits
-    loss = F.cross_entropy(
-        logits[:, :-1, :].contiguous().view(-1, logits.shape[-1]),
-        labels[:, 1:].contiguous().view(-1),
-        ignore_index=-100,
-    )
-    loss.backward()
-    optimizer.step()
-    changed = sum(
-        float((parameter.detach() - initial).abs().sum().item())
-        for (_, parameter), (_, initial) in zip(trainable, before)
-    )
-    if changed == 0:
-        raise RuntimeError("LoRA optimizer step did not change any trainable parameter")
-    loss_value = float(loss.detach().cpu().item())
-    trainable_count = sum(parameter.numel() for _, parameter in trainable)
-
-    out = Path(args.out)
-    adapter_dir = out / "adapter"
-    session.save_adapter(adapter_dir)
-    del trainable, before, optimizer, logits, labels, input_ids
-    del prompt_ids, completion_ids, loss, session
-    reloaded = ModelSession(config, adapter_path=adapter_dir)
-    post = reloaded.generate(
-        messages,
-        max_new_tokens=16,
-        temperature=0.0,
-        top_p=1.0,
-    )
-    record = {
-        "loss": loss_value,
-        "trainable_parameter_count": trainable_count,
-        "trainable_parameter_l1_change": changed,
-        "base_model_frozen": True,
-        "saved_adapter": str(adapter_dir.resolve()),
-        "reload_generation": post,
-    }
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "train-smoke.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({key: record[key] for key in ("loss", "trainable_parameter_count", "trainable_parameter_l1_change", "base_model_frozen")}, ensure_ascii=False))
+    target = Path(args.out) / "train-smoke.json"
+    target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({key: result[key] for key in
+                      ("backend", "trainer_step", "parameter_update", "adapter")}, ensure_ascii=False))
 
 
 def synthesize_command(args):

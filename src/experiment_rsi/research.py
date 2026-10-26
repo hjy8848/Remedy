@@ -80,6 +80,9 @@ def branch_messages(parent, experiment, diagnostic_report):
 
 
 def parse_candidate(text):
+    text = text.strip()
+    if text.startswith("```json") and text.endswith("```"):
+        text = text[len("```json"): -len("```")].strip()
     value = json.loads(text)
     if not isinstance(value, dict):
         raise ValueError("candidate must be a JSON object")

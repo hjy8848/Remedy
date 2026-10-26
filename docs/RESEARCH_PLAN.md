@@ -5,6 +5,11 @@
 版本：v1.0；日期：2026 年 10 月 25 日
 文档性质：实施计划，供讨论和后续开发使用。文中的新增目录、接口、命令和阶段产物均是拟实现规格，不表示已完成开发。
 
+
+## 训练实现更新（2026-10-26）
+
+GRPO 与 OPSD 已统一到 VeRL V1；下文关于独立训练损失或 MPS 参数更新的旧规格由本段替代。Host 保留任务合成、环境执行、独立评价和轨迹记录职责；VeRL 处理优势、反向传播、优化器、调度器与 checkpoint。多次模型调用按同一研究 trajectory 回放，原生 GRPO 先在组内比较 trajectory 末尾奖励，再将优势广播到所有调用。Remedy 的 trainer 扩展保留每条 trajectory 内总和为 1 的调用权重。OPSD 只接收 edit 样本，并使每个候选的特权反馈独立。服务器环境为 `.venv-verl`，Python 3.11；旧 Python 3.10 环境不能运行该固定提交。
+
 ## 当前原型进度（2026-10-25）
 
 本文件保留完整研究目标和 P0–P6 验收规格。当前实现是原型；代码路径接通不等于阶段验收通过，真实运行与训练证据单独记录。
@@ -176,7 +181,9 @@ Remedy/
     synthesis.py
     research.py
     evaluation.py
-    losses.py
+    verl_training.py
+    verl_runtime.py
+    verl_agent_loop.py
     train.py
   seeds/
     service.py
@@ -203,7 +210,7 @@ Remedy/
 | synthesis.py | 探索、目标构造、见证重放和合成任务 |
 | research.py | 单组实验、双分支修改和周期编排 |
 | evaluation.py | 配对评分与候选选择 |
-| losses.py | GRPO 与自蒸馏的数学目标 |
+| verl_training.py / verl_runtime.py / verl_agent_loop.py | 统一导出轨迹、接入 VeRL V1、回放和轨迹权重 |
 | train.py | 数据批次、反向传播和 checkpoint |
 
 不另建通用 ModelProvider、VerifierRegistry 或 AgentManager。实际需要的函数先放在承担该职责的模块中。
@@ -212,7 +219,7 @@ Remedy/
 
 ### 6.1 环境
 
-首个训练目标为一台 Linux/NVIDIA 机器，使用一个固定 Python 环境。建议以 Python 3.10 为起点，并在 P0 实测 ALFWorld/TextWorld 与训练依赖能否在该环境共同运行。
+首个训练目标为一台 Linux/NVIDIA 机器，使用一个固定 Python 环境。使用 Python 3.11+，并在 P0 实测 ALFWorld/TextWorld 与训练依赖能否在该环境共同运行。
 
 主要依赖：
 
@@ -232,7 +239,7 @@ Remedy/
 - 使用官方模型与生成接口。
 - 使用官方 LoRA 保存、加载和切换接口。
 - 使用标准优化器。
-- 在 losses.py 中实现本项目需要的两种损失。
+- GRPO 与 OPSD 均调用固定提交的 VeRL V1/FSDP trainer；项目只实现 Host 数据与轨迹权重的适配。
 - 不自写模型结构、注意力实现或优化器框架。
 
 这样可以直接表示多次独立研究调用、不同条件的教师输入和自定义实验奖励。首版不同时接入多个训练框架。

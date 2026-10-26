@@ -7,7 +7,7 @@ name = "remedy"
 version = "0.1.0"
 description = "Autonomous experiment synthesis for recursive agent improvement"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "alfworld>=0.4.2",
   "numpy>=1.24",
@@ -27,7 +27,15 @@ verl = [
   "uvicorn",
 ]
 verl-gpu = [
-  "verl[vllm,gpu] @ git+https://github.com/HaozheZhang6/verl.git@9268aad322df93cc61e9c168d66d395256dbe87a",
+  "verl[vllm] @ git+https://github.com/HaozheZhang6/verl.git@9268aad322df93cc61e9c168d66d395256dbe87a",
+  "torch==2.8.0+cu128",
+  "torchvision==0.23.0+cu128",
+  "torchaudio==2.8.0+cu128",
+  "vllm==0.11.0",
+  "xformers==0.0.32.post1",
+  "transformers==4.55.2",
+  "tokenizers==0.21.1",
+  "huggingface-hub==0.34.3",
   "cachetools",
   "TransferQueue==0.1.8",
   "fastapi",
