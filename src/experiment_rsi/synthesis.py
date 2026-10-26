@@ -370,6 +370,9 @@ def task_directed_commands(commands, target_object, target_receptacle,
 def explore_game(config, game_file, model, source_split, max_steps,
                  task_dir, parent_service=None):
     tasks = []
+    task_candidate_count = 0
+    verified_task_count = 0
+    witness_replay_steps = 0
     actions = []
     action_history = []
     blocked_actions = set()
@@ -538,6 +541,7 @@ def explore_game(config, game_file, model, source_split, max_steps,
                     if goal_key in seen_goals:
                         continue
                     seen_goals.add(goal_key)
+                    task_candidate_count += 1
                     task = make_task(
                         env.game_file,
                         task_dir,
@@ -551,8 +555,10 @@ def explore_game(config, game_file, model, source_split, max_steps,
                     if task is None:
                         continue
                     replay = replay_witness(config, task)
+                    witness_replay_steps += len(replay["actions"])
                     if replay["valid"]:
                         tasks.append(task)
+                        verified_task_count += 1
             previous_facts = current_facts
             view = result
             if result["done"]:
@@ -562,6 +568,10 @@ def explore_game(config, game_file, model, source_split, max_steps,
         "generations": generations,
         "hypothesis": hypothesis,
         "actions": actions,
+        "trajectory": action_history,
+        "task_candidate_count": task_candidate_count,
+        "verified_task_count": verified_task_count,
+        "witness_replay_steps": witness_replay_steps,
     }
 
 

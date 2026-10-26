@@ -38,6 +38,7 @@ verl-gpu = [
   "huggingface-hub==0.34.3",
   "cachetools",
   "TransferQueue==0.1.8",
+  "swanlab",
   "fastapi",
   "uvicorn",
 ]

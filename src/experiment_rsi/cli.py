@@ -262,7 +262,7 @@ def main():
     run_parser.add_argument("--selection-pool", required=True)
     run_parser.add_argument("--reward-pool", required=True)
     run_parser.add_argument("--periods", type=int, required=True)
-    run_parser.add_argument("--method", choices=("rl", "distill", "combined"), required=True)
+    run_parser.add_argument("--method", choices=("rl", "distill", "combined", "designer-only"), required=True)
     run_parser.add_argument("--parent", default="seeds/service.json")
     run_parser.add_argument("--experiment-adapter")
     run_parser.add_argument("--edit-adapter")

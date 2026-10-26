@@ -89,9 +89,13 @@ def build_verl_overrides(config, dataset_path, model_path, teacher_path, adapter
                          row_count, call_count, prompt_length, response_length, checkpoint_dir,
                          objective):
     lora = config["model"]["lora"]
+    tracking = config.get("tracking", {})
     dtype = config["model"]["dtype"]
     model_dtype = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}[dtype]
     token_budget = prompt_length + response_length
+    logger_backends = tracking.get("logger", ["console"])
+    project_name = tracking.get("project_name", "remedy")
+    experiment_name = tracking.get("trainer_experiment_name", objective)
     overrides = [
         "data.train_files={}".format(dataset_path),
         "data.val_files={}".format(dataset_path),
@@ -151,9 +155,9 @@ def build_verl_overrides(config, dataset_path, model_path, teacher_path, adapter
         "trainer.test_freq=-1",
         "trainer.val_before_train=False",
         "trainer.resume_mode=disable",
-        "trainer.logger=[console]",
-        "trainer.project_name=remedy",
-        "trainer.experiment_name={}".format(objective),
+        "trainer.logger=[{}]".format(",".join(logger_backends)),
+        "trainer.project_name={}".format(project_name),
+        "trainer.experiment_name={}".format(experiment_name),
         "trainer.default_local_dir={}".format(checkpoint_dir),
         "ray_kwargs.ray_init.num_cpus=8",
         "+ray_kwargs.ray_init.include_dashboard=False",
@@ -235,6 +239,8 @@ def train_with_verl(config, samples, out_dir, objective, adapter_path=None):
     env["RAY_TMPDIR"] = "/dev/shm/rmd-{}".format(tag)
     env["TRITON_CACHE_DIR"] = str(out_dir / "triton")
     env["HYDRA_FULL_ERROR"] = "1"
+    if tracking.get("swanlab_log_dir"):
+        env["SWANLAB_LOG_DIR"] = tracking["swanlab_log_dir"]
     command = [sys.executable, "-m", "experiment_rsi.verl_runtime", *overrides,
                "hydra.run.dir={}".format(out_dir / "hydra")]
     with (out_dir / "trainer.log").open("w", encoding="utf-8") as log:
@@ -266,6 +272,8 @@ def train_with_verl(config, samples, out_dir, objective, adapter_path=None):
         "group_count": len({s["group_id"] for s in samples}), "trainer_step": step,
         "trainable_parameter_count": sum(v.numel() for v in weights.values()),
         "trainable_parameter_l1_change": change, "parameter_update": change > 0,
+        "run_id": tracking.get("run_id"), "period": tracking.get("period"),
+        "trainer_experiment_name": experiment_name, "project_name": project_name,
         "dataset": str(dataset_path), "trainer_log": str(out_dir / "trainer.log"),
         "trainer_checkpoint": str(actor_checkpoint), "adapter": str(adapter_dir),
     }
