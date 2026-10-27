@@ -143,7 +143,9 @@ def build_verl_overrides(config, dataset_path, model_path, teacher_path, adapter
         "actor_rollout_ref.rollout.top_p={}".format(config["model"]["top_p"]),
         "actor_rollout_ref.rollout.dtype={}".format(dtype),
         "actor_rollout_ref.rollout.enforce_eager=True",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4",
+        "actor_rollout_ref.rollout.gpu_memory_utilization={}".format(
+            config["training"].get("rollout_gpu_memory_utilization", 0.4)
+        ),
         "actor_rollout_ref.rollout.max_model_len={}".format(token_budget),
         "actor_rollout_ref.rollout.max_num_batched_tokens={}".format(token_budget),
         "actor_rollout_ref.rollout.max_num_seqs=8",

@@ -30,6 +30,8 @@ run:
 training:
   learning_rate: 0.00001
   gradient_checkpointing: true
+  grpo_gpus_per_node: 2
+  rollout_gpu_memory_utilization: 0.5
 
 research:
   diagnostic_split: train
@@ -37,6 +39,7 @@ research:
   experiment_split: train
   experiments_per_group: 4
   edits_per_branch: 2
+  exploration_gpus_per_node: 2
 
 tracking:
   project_name: Remedy-Designer-Only

@@ -39,14 +39,14 @@ research:
   diagnostic_split: train
   diagnostic_games_per_period: 10
   experiment_split: train
-  experiments_per_group: 8
+  experiments_per_group: 4
   exploration_gpus_per_node: 2
   edits_per_branch: 2
-  batches_per_period: 20
+  batches_per_period: 5
   selection_seen_scenes: 15
   reward_seen_scenes: 15
 
 tracking:
   project_name: Remedy-Full-Combined
-  experiment_name: Remedy-Full-Combined
+  experiment_name: Remedy-Combined-3x5
   logger: [console, swanlab]

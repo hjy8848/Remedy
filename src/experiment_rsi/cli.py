@@ -108,6 +108,44 @@ def synthesize_command(args):
     print(json.dumps({"verified_tasks": len(tasks), "out": str(Path(args.out).resolve())}, ensure_ascii=False))
 
 
+def build_scene_command(args):
+    from .alfworld import AlfworldEpisode
+    from .config import load_config
+    from .evaluation import replace_native_objective
+    from .records import SyntheticTask
+    from .scene_builder import build_scene
+    from .synthesis import goal_reached, pddl_goal_expression, replay_witness, write_tasks
+
+    config = load_config(args.config)
+    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    scene = build_scene(args.source_game, spec, args.out)
+    with AlfworldEpisode(config["alfworld"]["config_path"], game_file=scene["game_file"], split=args.split) as env:
+        initial = env.reset()
+    result = {"scene": scene, "initial_goal_satisfied": goal_reached(scene["goal_atoms"], initial["facts"]),
+              "initial_observation": replace_native_objective(initial["observation"], scene["instruction"]),
+              "witness_replay": None}
+    if result["initial_goal_satisfied"]:
+        raise ValueError("constructed goal is satisfied at environment reset")
+    if args.actions:
+        actions = json.loads(Path(args.actions).read_text(encoding="utf-8"))
+        task = SyntheticTask(
+            task_id=scene["task_id"], source_game_file=scene["source_game_file"],
+            task_game_file=scene["game_file"], source_scene_id=scene["source_scene_id"],
+            instruction=scene["instruction"], goal_kind="place_all",
+            goal_atoms=scene["goal_atoms"], source_goal_text=scene["source_goal_text"],
+            custom_goal_text=pddl_goal_expression(scene["goal_atoms"]), witness_actions=actions,
+            source_split=args.split, generation_mode="constructed", experiment_spec=spec,
+        )
+        result["witness_replay"] = replay_witness(config, task)
+        if result["witness_replay"]["valid"]:
+            write_tasks(Path(args.out) / "tasks.jsonl", [task])
+    out = Path(args.out)
+    (out / "scene.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False))
+    if result["witness_replay"] is not None and not result["witness_replay"]["valid"]:
+        raise RuntimeError("constructed scene witness did not complete the goal")
+
+
 def replay_command(args):
     from .config import load_config
     from .research import write_json
@@ -218,6 +256,15 @@ def main():
         command.add_argument("--config", required=True)
         command.add_argument("--out", required=True)
         command.set_defaults(handler=handler)
+
+    builder = subparsers.add_parser("build-scene")
+    builder.add_argument("--config", required=True)
+    builder.add_argument("--source-game", required=True)
+    builder.add_argument("--spec", required=True)
+    builder.add_argument("--out", required=True)
+    builder.add_argument("--split", default="train")
+    builder.add_argument("--actions", help="JSON list of witness actions to replay")
+    builder.set_defaults(handler=build_scene_command)
 
     synthesize_parser = subparsers.add_parser("synthesize")
     synthesize_parser.add_argument("--config", required=True)

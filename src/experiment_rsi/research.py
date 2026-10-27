@@ -481,7 +481,7 @@ def swanlab_research_record(feedback, experiments_path, swanlab_module):
                 key: item.get(key)
                 for key in (
                     "experiment_id", "hypothesis_id", "hypothesis", "hypothesis_record",
-                    "service_version",
+                    "service_version", "generation_mode", "experiment_spec",
                     "research_feedback", "diagnostic_target", "task_ids", "task_candidates",
                     "experiment_utility", "with_evidence_gain", "without_evidence_gain",
                     "candidate_results",
@@ -659,7 +659,15 @@ def experiment_group(config, selection_path, reward_path, out_dir, parent_path,
         ModelSession(config, adapter_path=experiment_adapter, device=device)
         for device in devices
     ]
-    explored_rows = explore_games(
+    generation_mode = config["research"].get("generation_mode", "exploration")
+    if generation_mode == "constructed":
+        from .constructed import construct_experiments
+        generate_experiments = construct_experiments
+    elif generation_mode == "exploration":
+        generate_experiments = explore_games
+    else:
+        raise ValueError("unknown experiment generation mode: {}".format(generation_mode))
+    explored_rows = generate_experiments(
         config,
         game_files,
         experiment_models,
@@ -679,6 +687,8 @@ def experiment_group(config, selection_path, reward_path, out_dir, parent_path,
                 "hypothesis_id": explored.get("hypothesis_id"),
                 "hypothesis_record": explored.get("hypothesis_record"),
                 "hypothesis_error": explored.get("hypothesis_error"),
+                "generation_mode": generation_mode,
+                "experiment_spec": explored.get("experiment_spec"),
                 "research_feedback": explored["research_feedback"],
                 "diagnostic_target": explored.get("diagnostic_target"),
                 "task_candidates": explored["task_candidate_records"],
@@ -897,6 +907,8 @@ def experiment_group(config, selection_path, reward_path, out_dir, parent_path,
                     "research_feedback": experiment["research_feedback"],
                     "hypothesis": experiment["hypothesis"],
                     "hypothesis_record": experiment.get("hypothesis_record"),
+                    "generation_mode": experiment["generation_mode"],
+                    "experiment_spec": experiment["experiment_spec"],
                     "task_ids": [task.task_id for task in experiment["tasks"]],
                 },
                 model_revision=generation["model_revision"],
@@ -911,6 +923,8 @@ def experiment_group(config, selection_path, reward_path, out_dir, parent_path,
             "hypothesis": experiment["hypothesis"],
             "hypothesis_record": experiment.get("hypothesis_record"),
             "hypothesis_error": experiment.get("hypothesis_error"),
+            "generation_mode": experiment["generation_mode"],
+            "experiment_spec": experiment["experiment_spec"],
             "research_feedback": experiment["research_feedback"],
             "diagnostic_target": experiment.get("diagnostic_target"),
             "task_candidates": experiment["task_candidates"],

@@ -507,18 +507,67 @@ def parse_experiment_hypothesis(text, source_object, source_receptacle,
     return value
 
 
-def hypothesis_prompt_messages(parent_service, view, research_feedback, solver_base_model):
+def parse_hypothesis_description(text, observation, commands):
+    text = text.strip()
+    if text.startswith("```json") and text.endswith("```"):
+        text = text[len("```json"): -len("```")].strip()
+    value = json.loads(text)
+    required = {"hypothesis", "diagnostic_behavior", "focus_object"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("hypothesis description must contain exactly three required fields")
+    for field in required:
+        if not isinstance(value[field], str) or not value[field].strip():
+            raise ValueError("hypothesis field {!r} must be non-empty text".format(field))
+        value[field] = value[field].strip()[:240]
+    focus_object = value["focus_object"].lower()
+    available_text = "\n".join([observation] + list(commands)).lower()
+    if not re.search(
+        r"(?<![\w-]){}(?![\w-])".format(re.escape(focus_object)), available_text
+    ):
+        raise ValueError("focus_object is not grounded in the current ALFWorld scene")
+    return value
+
+
+def hypothesis_target_choices(view, source_receptacle, research_feedback):
+    destinations = sorted({
+        command[6:].strip()
+        for command in view["admissible_commands"]
+        if command.lower().startswith("go to ")
+        and not location_matches(command[6:], source_receptacle or "")
+    })
+    valid_refs = sorted(set(research_feedback.get("reference_ids", [])))
+    required_refs = sorted(set(research_feedback.get("required_reference_ids", [])))
+    if not set(required_refs).issubset(valid_refs):
+        raise ValueError("required research feedback references are absent from reference_ids")
+    refs_to_cite = required_refs or valid_refs
+    ref_options = [[ref] for ref in refs_to_cite]
+    if refs_to_cite:
+        ref_options.append(refs_to_cite)
+    else:
+        ref_options = [[]]
+    choices = [
+        json.dumps(
+            {"focus_receptacle": destination, "feedback_refs": refs},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for destination in destinations
+        for refs in ref_options
+    ]
+    return destinations, choices
+
+
+def hypothesis_prompt_messages(parent_service, view, research_feedback, solver_base_model,
+                               source_receptacle):
     return [
         {
             "role": "system",
             "content": (
-                "Design one ALFWorld experiment that probes a capability implicated by the supplied "
-                "Solver feedback. Return JSON only, with exactly these fields: hypothesis, "
-                "diagnostic_behavior, focus_object, focus_receptacle, feedback_refs. Choose the "
-                "object and receptacle from this scene, and choose a receptacle type different from "
-                "the native task destination so the witnessed goal is new. Name feedback_refs exactly "
-                "as shown in the feedback. Cite at least one finding when feedback contains references; "
-                "use an empty list only when no feedback references exist. Do not propose a solution."
+                "Design one testable ALFWorld experiment that probes a capability implicated by the "
+                "supplied Solver feedback. Return JSON only, with exactly these fields: hypothesis, "
+                "diagnostic_behavior, focus_object. The focus object must be grounded in the current "
+                "scene. Do not name a destination or feedback reference; those are selected in a "
+                "separate constrained step. Do not propose a solution."
             ),
         },
         {
@@ -529,6 +578,37 @@ def hypothesis_prompt_messages(parent_service, view, research_feedback, solver_b
                     "solver_base_model": solver_base_model,
                     "initial_observation": view["observation"],
                     "admissible_commands": view["admissible_commands"],
+                    "native_task_destination": source_receptacle,
+                    "research_feedback": research_feedback,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+
+def hypothesis_target_prompt_messages(description, view, source_receptacle,
+                                      destinations, research_feedback, choices):
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Choose the ALFWorld destination that best tests the supplied hypothesis and cite "
+                "the supplied Solver finding(s) that support it. Return one JSON choice from the "
+                "provided allowed_target_choices list, exactly as written. Do not add other text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "hypothesis": description["hypothesis"],
+                    "diagnostic_behavior": description["diagnostic_behavior"],
+                    "focus_object": description["focus_object"],
+                    "native_task_destination": source_receptacle,
+                    "allowed_focus_receptacles": destinations,
+                    "available_feedback_ids": research_feedback.get("reference_ids", []),
+                    "allowed_target_choices": choices,
                     "research_feedback": research_feedback,
                 },
                 ensure_ascii=False,
@@ -694,6 +774,7 @@ def explore_games(config, game_files, models, source_split, max_steps,
                             "name": Path(config["model"]["path"]).name,
                             "revision": config["model"].get("revision"),
                         },
+                        state["source_receptacle"],
                     )
                 )
 
@@ -710,24 +791,40 @@ def explore_games(config, game_files, models, source_split, max_steps,
                 config["model"]["temperature"],
                 config["model"]["top_p"],
             )
+            target_states, target_prompts, target_choices = [], [], []
             for state, generation in zip(states, hypothesis_generations):
                 state["generations"].append(generation)
                 state["raw_hypothesis"] = generation["generated_text"].strip()
                 try:
-                    record = parse_experiment_hypothesis(
-                        state["raw_hypothesis"],
-                        state["source_object"],
-                        state["source_receptacle"],
-                        state["view"]["observation"],
-                        state["view"]["admissible_commands"],
-                        research_feedback,
-                    )
+                    description = parse_hypothesis_description(
+                        state["raw_hypothesis"], state["view"]["observation"],
+                        state["view"]["admissible_commands"])
+                    destinations, choices = hypothesis_target_choices(
+                        state["view"], state["source_receptacle"], research_feedback)
+                    if not choices:
+                        raise ValueError("no supported alternative target receptacle")
                 except (json.JSONDecodeError, ValueError) as error:
                     state["hypothesis_error"] = str(error)
                     state["hypothesis"] = state["raw_hypothesis"]
                     state["hypothesis_record"] = None
                     state["active"] = False
                     continue
+                state["description"] = description
+                target_states.append(state)
+                target_choices.append(choices)
+                target_prompts.append(hypothesis_target_prompt_messages(
+                    description, state["view"], state["source_receptacle"],
+                    destinations, research_feedback, choices))
+
+            target_generations = _generate_across_models(
+                models, model_executor, target_prompts, target_choices, 96,
+                config["model"]["temperature"], config["model"]["top_p"])
+            for state, generation in zip(target_states, target_generations):
+                state["generations"].append(generation)
+                combined = dict(state["description"], **json.loads(generation["generated_text"]))
+                record = parse_experiment_hypothesis(
+                    json.dumps(combined), state["source_object"], state["source_receptacle"],
+                    state["view"]["observation"], state["view"]["admissible_commands"], research_feedback)
                 state["hypothesis_record"] = record
                 state["hypothesis"] = record["hypothesis"]
                 state["hypothesis_id"] = state["experiment_id"] + "/hypothesis"
@@ -775,7 +872,7 @@ def explore_games(config, game_files, models, source_split, max_steps,
                     else:
                         preferred = available
                     preferred = [command for command in preferred if command in available]
-                    choices = preferred if state["carrying_object"] and preferred else available
+                    choices = preferred if preferred else available
                     state["available_commands"] = choices
                     if len(choices) == 1:
                         state["selected_action"] = choices[0]

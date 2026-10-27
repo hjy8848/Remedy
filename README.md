@@ -79,6 +79,29 @@ remedy research-group --config configs/smoke.yaml \
 
 `P` 是候选 Python 策略，`K` 是 JSON 经验列表。P 通过 `step(view, state)` 返回直接动作或模型请求；Host 持有模型、环境和评分逻辑，并仅把公开观察、动作历史、合法命令、K 与剩余预算传给 P。候选在无网络、只读文件系统、有限 CPU/内存的 Docker 容器内运行，每个 episode 复用一个 worker。目标由真实轨迹中新出现的 PDDL 放置谓词构成，源任务文件保留场景、对象、域和语法，派生文件只替换目标公式。每条任务保存完整成功见证轨迹；Host 在派生目标环境中重放见证并用真实 PDDL `won` 和谓词状态认证，Solver 也从这个派生任务的初始状态开始。探索生成、见证重放和求解都使用 ALFWorld 的合法文本动作。
 
+### 构造式实验场景
+
+`research.generation_mode: constructed` 让 Designer 在选定的训练源场景中指定一种可拿取物体、1–3 个实例、初始容器和 `place_all` 目标。场景构造器沿用源游戏的 PDDL domain 和 grammar，修改初始状态和目标；生成实例时使用同类型物体作为模板。Designer 在新游戏中通过合法动作尝试完成目标，只有成功且从初始状态重放通过的任务才进入研究。源场景 ID 沿用基础游戏，Selection、Reward 和 Test 仍按该 ID 隔离。未指定时沿用 `exploration` 模式。
+
+构造器可以单独在 CPU 上运行。规格中的 `base_scene` 必须与 `--source-game` 的源场景 ID 一致，例如：
+
+```json
+{
+  "base_scene": "FloorPlan307:307",
+  "objects": [{"type": "Laptop", "count": 3, "initial_receptacle": "Bed"}],
+  "goal": {"type": "place_all", "object_type": "Laptop", "count": 3, "destination_type": "Desk"}
+}
+```
+
+```bash
+remedy build-scene --config configs/designer_only.yaml \
+  --source-game /path/to/source/game.tw-pddl --spec /path/to/spec.json \
+  --out runs/constructed-scene
+# 可选：--actions /path/to/actions.json，文件是动作字符串数组；重放成功才写 tasks.jsonl。
+```
+
+`scene.json` 记录生成游戏和初始状态检查；只加载成功不代表任务可解。要在研究流程中使用构造式模式，在配置的 `research` 下设置 `generation_mode: constructed`，并继续提供独立的 Selection 和 Reward 任务池。
+
 P 的返回值采用两个明确结构：直接动作返回 `{"kind":"action","action":"...","state":{...}}`；请求 Host 调用基础模型返回 `{"kind":"model","messages":[...],"state":{...}}`。worker 只运行 Python 标准库代码，不能直接访问模型权重、环境对象或评价任务。
 
 编辑策略可用 `--objective opsd` 训练：样本中的 response 是当前策略在真实研究 prompt 上生成的原始 token；自定义 VeRL AgentLoop 原样回放它们，不重新采样。teacher 额外看到 Host 执行候选后记录的验证反馈，并在同一 response 前缀上计算 top-k 分布；VeRL 的 forward-KL 更新学生 LoRA。训练只接收有诊断证据分支，最终测试反馈不会进入 teacher。直接 GRPO 是对照方法。
@@ -96,9 +119,10 @@ remedy run --config configs/pilot.yaml \
 
 `--method rl` 同时用 GRPO 更新实验和修改策略；`distill` 冻结实验策略、用 OPSD 更新修改策略；`combined` 用实验价值 GRPO 和修改反馈 OPSD。多个周期的自动演化已接通，M 自改尚未实现。
 
-正式 combined 主实验使用 `configs/full_remedy.yaml`，每周期包含多个在线批次：每批用当前 Designer 采集新的 8 条实验轨迹、生成两个证据分支的修改候选，然后分别执行一次 VeRL GRPO 和一次 VeRL OPSD 更新。一个周期内 Service 父版本固定；批内用该周期的任务块筛选候选，周期结束时再在完整 Selection 池上配对复核，确认下一周期的 Service。Selection、Reward、ID Test 和 OOD Test 按源场景分区，测试任务只用于首尾评价。任务池少于周期数时，只在自身角色池内轮转复用，绝不跨角色共享。先生成固定任务池，再启动训练：
+首个缩小版 combined 完整闭环使用 `configs/full_remedy.yaml`：3 个周期、每周期 5 个在线批次、每批 4 条实验轨迹。每条轨迹生成两个证据分支的修改候选，然后分别执行 VeRL GRPO 和 VeRL OPSD 更新。总计 15 次 Designer 更新、15 次 Editor 更新，保留每周期 10 个 Solver 诊断场景。一个周期内 Service 父版本固定；批内用该周期的任务块筛选候选，周期结束时再在完整 Selection 池上配对复核，确认下一周期的 Service。Selection、Reward、ID Test 和 OOD Test 按源场景分区，测试任务只用于首尾评价。任务池少于周期数时，只在自身角色池内轮转复用，绝不跨角色共享。先在同一个 shell 中设置 ALFWorld 数据路径，生成固定任务池，再启动训练：
 
 ```bash
+export ALFWORLD_DATA=/home/hejingyu/.cache/alfworld/alfworld
 python scripts/prepare_full_pools.py --config configs/full_remedy.yaml \
   --out runs/full-pools
 python scripts/run_with_swanlab_netrc.py run --config configs/full_remedy.yaml \
@@ -106,8 +130,8 @@ python scripts/run_with_swanlab_netrc.py run --config configs/full_remedy.yaml \
   --reward-pool runs/full-pools/reward/tasks.jsonl \
   --test-tasks runs/full-pools/id_test/tasks.jsonl \
   --ood-test-tasks runs/full-pools/ood_test/tasks.jsonl \
-  --periods 10 --batches-per-period 20 --method combined \
-  --out runs/full-combined
+  --periods 3 --batches-per-period 5 --method combined \
+  --out runs/full-combined-reduced-3x5
 ```
 
 启动脚本从服务器已有的 `~/.swanlab/.netrc` 读取凭据，并只把 `SWANLAB_API_KEY` 注入训练进程环境，不写入仓库。VeRL 将每次 Designer/Editor 更新分别记入 SwanLab；研究主运行还记录任务合成率、修改收益、Service 选择集成绩、环境交互量和测试集首尾差值。`progress.json` 与各批次的训练日志用于核对真实完成的 optimizer updates；中断或报错不会被记作完整实验。
