@@ -24,6 +24,32 @@ def replace_native_objective(observation, objective):
     return TASK_LINE.sub("Your task is to {}".format(objective), observation)
 
 
+def direct_action_messages(task, observation, recent_actions, allowed_commands, remaining_steps):
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You control ALFWorld. Choose one command from the complete list of currently allowed "
+                "commands. Use the task, observation, recent actions, and remaining step count to "
+                "decide. Output the chosen command exactly, with no explanation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "task": task,
+                    "observation": observation,
+                    "recent_actions": recent_actions[-5:],
+                    "allowed_commands": allowed_commands,
+                    "remaining_steps": remaining_steps,
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+
 def task_progress(task, facts):
     available = {fact_key(fact) for fact in facts}
     completed = sum(fact_key(atom) in available for atom in task.goal_atoms)
@@ -142,28 +168,13 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                 action_choices = view["admissible_commands"]
                 directive = {
                     "kind": "model",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You control ALFWorld. Choose one command from the complete list of "
-                                "currently allowed commands. Use the task, observation, recent actions, "
-                                "and reusable knowledge to decide. Output the chosen command exactly, "
-                                "with no explanation."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": json.dumps({
-                                "task": objective if task else native_objective,
-                                "observation": observation,
-                                "recent_actions": history[-5:],
-                                "allowed_commands": action_choices,
-                                "knowledge": service["knowledge"],
-                                "remaining_steps": step_budget - step_index,
-                            }, ensure_ascii=False),
-                        },
-                    ],
+                    "messages": direct_action_messages(
+                        objective if task else native_objective,
+                        observation,
+                        history,
+                        action_choices,
+                        step_budget - step_index,
+                    ),
                 }
                 policy_state = {"action_choices": action_choices}
             else:

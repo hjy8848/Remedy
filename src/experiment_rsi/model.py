@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import nullcontext
 import random
 
 
@@ -74,6 +75,7 @@ class ModelSession:
         self.model.to(self.device)
         self.model_revision = self.revision
         self.adapter_version = str(adapter_path) if adapter_path else ("trainable-new" if trainable else "base")
+        self.has_adapter = adapter_path is not None or trainable
 
     def encode_messages(self, messages):
         encoded = self.tokenizer.apply_chat_template(
@@ -81,7 +83,8 @@ class ModelSession:
         )
         return encoded.to(self.device)
 
-    def generate(self, messages, max_new_tokens, temperature, top_p, allowed_texts=None):
+    def generate(self, messages, max_new_tokens, temperature, top_p, allowed_texts=None,
+                 use_adapter=True):
         torch = self.torch
         prompt_ids = self.encode_messages(messages)
         self.model.eval()
@@ -120,7 +123,11 @@ class ModelSession:
 
             sampling["max_new_tokens"] = max(len(token_ids) for token_ids in tokenized_texts) + 1
             sampling["prefix_allowed_tokens_fn"] = prefix_allowed_tokens
-        with torch.no_grad():
+        if not use_adapter and self.has_adapter:
+            adapter_context = self.model.disable_adapter()
+        else:
+            adapter_context = nullcontext()
+        with adapter_context, torch.no_grad():
             output = self.model.generate(prompt_ids, attention_mask=torch.ones_like(prompt_ids), **sampling)
         generated_ids = output.sequences[:, prompt_ids.shape[1]:]
         transition = self.model.compute_transition_scores(

@@ -1,11 +1,11 @@
-"""Run the frozen-model Remedy skills experiment on ALFWorld."""
+"""Train the Solver on Designer-generated, planner-verified ALFWorld tasks."""
 
 import argparse
-import copy
 import json
 import multiprocessing as mp
 import random
-import shutil
+import re
+from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -16,10 +16,10 @@ from experiment_rsi.constructed import _parse_spec
 from experiment_rsi.evaluation import run_episode
 from experiment_rsi.model import ModelSession, seed_everything
 from experiment_rsi.records import SyntheticTask
-from experiment_rsi.research import summarize_diagnostic_results
 from experiment_rsi.scene_builder import build_scene, inspect_scene
+from experiment_rsi.solver_sft import collect_solver_sft_examples, train_solver_sft
 from experiment_rsi.synthesis import (
-    goal_reached, pddl_goal_expression, read_tasks, replay_witness, source_scene_id,
+    goal_reached, pddl_goal_expression, replay_witness, source_scene_id,
     supported_placement_game, write_tasks,
 )
 
@@ -50,7 +50,9 @@ def grouped_games(config, split):
     return {scene: sorted(paths)[0] for scene, paths in groups.items()}
 
 
-def make_manifest(config, periods, diagnostics, experiments, selection_count, id_count, ood_count):
+def make_manifest(config, periods, diagnostics, task_count, id_count, ood_count):
+    if min(periods, diagnostics, task_count, id_count, ood_count) < 1:
+        raise ValueError("period, diagnostic, task, ID-test, and OOD-test counts must be positive")
     rng = random.Random(config["run"]["seed"])
     seen = grouped_games(config, "eval_in_distribution")
     unseen = grouped_games(config, "eval_out_of_distribution")
@@ -60,27 +62,26 @@ def make_manifest(config, periods, diagnostics, experiments, selection_count, id
     ood = unseen_scenes[:ood_count]
     seen_scenes = sorted(set(seen) - set(ood))
     rng.shuffle(seen_scenes)
-    if len(ood) < ood_count or len(seen_scenes) < selection_count + id_count:
-        raise ValueError("not enough distinct supported scenes for the requested evaluation pools")
-    selection = seen_scenes[:selection_count]
-    id_test = seen_scenes[selection_count:selection_count + id_count]
-    reserved = set(selection + id_test + ood)
+    if len(ood) < ood_count or len(seen_scenes) < id_count:
+        raise ValueError("not enough distinct supported scenes for the requested ID/OOD test pools")
+    id_test = seen_scenes[:id_count]
+    reserved = set(id_test + ood)
     train_scenes = sorted(set(train) - reserved)
     rng.shuffle(train_scenes)
-    needed = periods * (diagnostics + experiments)
+    scenes_per_period = diagnostics + task_count
+    needed = periods * scenes_per_period
     if len(train_scenes) < needed:
         raise ValueError("need {} separate training scenes, found {}".format(needed, len(train_scenes)))
     rounds = []
     for period in range(periods):
-        start = period * (diagnostics + experiments)
+        start = period * scenes_per_period
         diagnostic_scenes = train_scenes[start:start + diagnostics]
-        experiment_scenes = train_scenes[start + diagnostics:start + diagnostics + experiments]
+        task_scenes = train_scenes[start + diagnostics:start + scenes_per_period]
         rounds.append({
             "diagnostic": [{"scene": scene, "game": train[scene]} for scene in diagnostic_scenes],
-            "experiment": [{"scene": scene, "game": train[scene]} for scene in experiment_scenes],
+            "tasks": [{"scene": scene, "game": train[scene]} for scene in task_scenes],
         })
     return {
-        "selection": [{"scene": scene, "game": seen[scene], "split": "eval_in_distribution"} for scene in selection],
         "id_test": [{"scene": scene, "game": seen[scene], "split": "eval_in_distribution"} for scene in id_test],
         "ood_test": [{"scene": scene, "game": unseen[scene], "split": "eval_out_of_distribution"} for scene in ood],
         "periods": rounds,
@@ -91,39 +92,66 @@ _MODEL = None
 _CONFIG = None
 
 
-def init_worker(config, devices):
+def init_worker(config, devices, adapter_path):
     global _MODEL, _CONFIG
     device = devices.get()
     _CONFIG = config
-    _MODEL = ModelSession(config, device="cuda:{}".format(device))
-    log("model ready on cuda:{}".format(device))
+    _MODEL = ModelSession(config, adapter_path=adapter_path, device="cuda:{}".format(device))
+    log("model ready on cuda:{} adapter={}".format(device, adapter_path or "base"))
+
+
+@contextmanager
+def worker_pool(config, gpus, adapter_path):
+    context = mp.get_context("spawn")
+    devices = context.Queue()
+    for device in range(gpus):
+        devices.put(device)
+    try:
+        with ProcessPoolExecutor(
+            max_workers=gpus,
+            mp_context=context,
+            initializer=init_worker,
+            initargs=(config, devices, str(adapter_path) if adapter_path else None),
+        ) as executor:
+            yield executor
+    finally:
+        devices.close()
+        devices.join_thread()
 
 
 def worker_generate(job):
     seed_everything(job["seed"], _MODEL.torch)
     result = _MODEL.generate(
-        job["messages"], max_new_tokens=job["max_new_tokens"],
-        temperature=_CONFIG["model"]["temperature"], top_p=_CONFIG["model"]["top_p"],
+        job["messages"],
+        max_new_tokens=job["max_new_tokens"],
+        temperature=_CONFIG["model"]["temperature"],
+        top_p=_CONFIG["model"]["top_p"],
+        use_adapter=False,
     )
     return result["generated_text"]
 
 
 def worker_episode(job):
-    config = copy.deepcopy(_CONFIG)
+    config = dict(_CONFIG)
+    config["alfworld"] = dict(_CONFIG["alfworld"])
     config["alfworld"]["split"] = job["split"]
     seed_everything(job["seed"], _MODEL.torch)
     result = run_episode(
-        config, job["service"], _MODEL, job["game"], task=job.get("task"),
-        max_steps=config["run"]["max_steps"], seed=job["seed"],
-        action_mode=job["action_mode"],
+        config,
+        None,
+        _MODEL,
+        job["game"],
+        task=job.get("task"),
+        max_steps=config["run"]["max_steps"],
+        seed=job["seed"],
+        action_mode="direct",
     )
     result["source_scene_id"] = job["scene"]
     return result
 
 
-def evaluate(executor, service, entries, seed):
-    jobs = [{**entry, "service": service, "seed": seed + i, "action_mode": "direct"}
-            for i, entry in enumerate(entries)]
+def evaluate(executor, entries, seed):
+    jobs = [{**entry, "seed": seed + index} for index, entry in enumerate(entries)]
     results = []
     for result in executor.map(worker_episode, jobs):
         results.append(result)
@@ -131,13 +159,15 @@ def evaluate(executor, service, entries, seed):
             len(results), len(jobs), result["source_scene_id"], result["success"],
             result["steps"], result["candidate_error"]))
     success = sum(result["success"] for result in results)
-    return {"success_count": success, "task_count": len(results),
-            "success_rate": success / len(results),
-            "model_action_calls": sum(step["policy_kind"] == "model" for result in results for step in result["trace"]),
-            "results": results}
+    return {
+        "success_count": success,
+        "task_count": len(results),
+        "success_rate": success / len(results),
+        "results": results,
+    }
 
 
-def skill_task_messages(game_file, service, feedback):
+def designer_task_messages(game_file, feedback):
     game = json.loads(Path(game_file).read_text(encoding="utf-8"))
     scene = inspect_scene(game["pddl_problem"])
     containments = sorted({(args[0].removesuffix("type"), args[1].removesuffix("type"))
@@ -146,22 +176,20 @@ def skill_task_messages(game_file, service, feedback):
                            and args[1].removesuffix("type") in scene["objects"]})
     return [
         {"role": "system", "content": (
-            "Design an ALFWorld placement experiment that directly challenges a failure in the "
-            "supplied Solver feedback. Return JSON with hypothesis, diagnostic_behavior, "
+            "Design an ALFWorld placement training task that targets a concrete weakness in the "
+            "supplied Solver diagnosis. Return JSON with hypothesis, diagnostic_behavior, "
             "feedback_refs, base_scene, objects, and goal. Use the provided base_scene. "
             "objects is a list of one to three distinct object types; each entry has type, count "
             "(1 to 3), and initial_receptacle. goal has type 'place_all' and a placements list "
             "with exactly one entry per object type; each entry has object_type, count, and "
             "destination_type. Counts must match objects. Cite at least one supplied feedback "
-            "reference. Use only listed object, receptacle, "
-            "and containment types. Make the task challenging enough to expose the cited Solver "
-            "weakness; do not favor one-object, shortest-path, or otherwise easy tasks. Use multiple "
-            "objects, goals, or container interactions when they test that weakness. Do not write PDDL; "
-            "the host planner and ALFWorld replay will validate the task.")},
+            "reference and make the task exercise the cited behavior. Use only listed object, "
+            "receptacle, and containment types. Do not make the task artificially easy; use multiple "
+            "objects, destinations, or container interactions when they fit the diagnosed weakness. "
+            "Do not write PDDL. Fast Downward and ALFWorld replay will verify the proposal.")},
         {"role": "user", "content": json.dumps({
             "base_scene": source_scene_id(game_file),
-            "current_knowledge": service["knowledge"],
-            "research_feedback": feedback,
+            "solver_feedback": feedback,
             "pickupable_object_types": sorted(scene["objects"]),
             "receptacle_counts": {key: len(value) for key, value in scene["receptacles"].items()},
             "can_contain": [{"receptacle": receptacle, "object": object_type}
@@ -222,146 +250,165 @@ def plan_task(config, scene, spec, experiment_id):
     return task, replay
 
 
-def _compact_solver_result(result):
-    return {
-        "success": result["success"],
-        "candidate_error": result["candidate_error"],
-        "steps": result["steps"],
-        "goal_progress": result["goal_progress"],
-        "trace": [{"action": step["action"], "observation": step["observation"],
-                   "goal_progress": step["goal_progress"]} for step in result["trace"]],
-    }
-
-
-def design_tasks(executor, config, service, feedback, entries, output, period, attempts):
+def design_tasks(executor, config, feedback, entries, output, period, attempts):
     pending = list(range(len(entries)))
     accepted = {}
-    accepted_results = {}
-    records = []
     revision_feedback = {}
+    records = []
     for attempt in range(attempts):
         if not pending:
             break
         jobs = []
         for index in pending:
-            messages = skill_task_messages(entries[index]["game"], service, feedback)
+            messages = designer_task_messages(entries[index]["game"], feedback)
             if index in revision_feedback:
                 messages.append({"role": "user", "content": revision_feedback[index]})
-            jobs.append({"messages": messages, "seed": config["run"]["seed"] + period * 1000 + attempt * 100 + index,
-                         "max_new_tokens": 768})
+            jobs.append({
+                "messages": messages,
+                "seed": config["run"]["seed"] + period * 1000 + attempt * 100 + index,
+                "max_new_tokens": 768,
+            })
         outputs = list(executor.map(worker_generate, jobs))
         remaining = []
-        proposed = []
         attempt_records = []
         for index, job, output_text in zip(pending, jobs, outputs):
-            experiment_id = "period-{:02d}/experiment-{:02d}".format(period, index + 1)
-            record = {"experiment_id": experiment_id, "source_scene_id": entries[index]["scene"],
-                      "attempt": attempt + 1, "prompt": job["messages"], "output": output_text}
+            experiment_id = "period-{:02d}/task-{:02d}".format(period, index + 1)
+            record = {
+                "experiment_id": experiment_id,
+                "source_scene_id": entries[index]["scene"],
+                "attempt": attempt + 1,
+                "prompt": job["messages"],
+                "output": output_text,
+            }
             try:
                 spec = _parse_spec(output_text, feedback)
                 scene = build_scene(entries[index]["game"], spec, output / "task_games")
                 task, replay = plan_task(config, scene, spec, experiment_id)
             except (json.JSONDecodeError, ValueError, KeyError, TypeError) as error:
                 revision_feedback[index] = (
-                    "The previous proposal was rejected: {}. Correct the task specification, "
-                    "while keeping it challenging and tied to the diagnostic behavior."
+                    "The previous proposal was rejected: {}. Correct the task specification and "
+                    "keep it tied to a cited Solver failure."
                 ).format(error)
                 record["rejection_reason"] = str(error)
                 remaining.append(index)
-                attempt_records.append(record)
             else:
-                record.update({"spec": spec, "task": asdict(task), "witness_replay": replay,
-                               "witness_source": "host_fast_downward"})
-                proposed.append((index, task, record))
-        if proposed:
-            attempt_entries = [{"scene": task.source_scene_id, "game": task.task_game_file,
-                                "split": task.source_split, "task": task}
-                               for _, task, _ in proposed]
-            attempt_results = evaluate(
-                executor, service, attempt_entries,
-                60000 + period * 10000 + attempt * 1000,
-            )
-            for (index, task, record), result in zip(proposed, attempt_results["results"]):
-                record["solver_attempt"] = _compact_solver_result(result)
-                if result["candidate_error"]:
-                    record["rejection_reason"] = "solver_execution_error"
-                    attempt_records.append(record)
-                    records.extend(attempt_records)
-                    write_jsonl(output / "task_attempts.jsonl", records)
-                    raise RuntimeError(
-                        "Solver execution failed while validating a proposed challenge: {}".format(
-                            result["candidate_error"]
-                        )
-                    )
-                if result["success"]:
-                    record["rejection_reason"] = "baseline_solver_solved_task"
-                    revision_feedback[index] = (
-                        "The unchanged Solver solved your previous planner-verified task in {} "
-                        "steps. Propose a materially more challenging task that still tests the "
-                        "same diagnostic behavior; do not merely rename objects or locations."
-                    ).format(result["steps"])
-                    remaining.append(index)
-                else:
-                    record["rejection_reason"] = None
-                    accepted[index] = task
-                    accepted_results[index] = result
-                attempt_records.append(record)
+                record.update({
+                    "spec": spec,
+                    "task": asdict(task),
+                    "witness_replay": replay,
+                    "witness_source": "host_fast_downward",
+                })
+                record["rejection_reason"] = None
+                accepted[index] = task
+            attempt_records.append(record)
         records.extend(attempt_records)
         for record in attempt_records:
-            log("period {} task {} attempt {}: {}".format(
-                period, record["experiment_id"], attempt + 1,
-                record.get("rejection_reason", "verified failure challenge")))
+            log("period {} {} attempt {}: {}".format(
+                period, record["experiment_id"], record["attempt"],
+                record.get("rejection_reason") or "planner and replay verified"))
         write_jsonl(output / "task_attempts.jsonl", records)
         pending = remaining
-    for index in pending:
-        experiment_id = "period-{:02d}/experiment-{:02d}".format(period, index + 1)
-        for record in reversed(records):
-            if record["experiment_id"] == experiment_id:
-                record["final_status"] = "no_solver_failure_found_after_attempts"
-                break
-    write_jsonl(output / "task_attempts.jsonl", records)
     tasks = [accepted[index] for index in sorted(accepted)]
-    results = [accepted_results[index] for index in sorted(accepted)]
-    success_count = sum(result["success"] for result in results)
-    return tasks, {
-        "success_count": success_count,
-        "task_count": len(results),
-        "success_rate": success_count / len(results) if results else None,
-        "model_action_calls": sum(
-            step["policy_kind"] == "model" for result in results for step in result["trace"]
-        ),
-        "results": results,
+    write_tasks(output / "tasks.jsonl", tasks)
+    if len(tasks) != len(entries):
+        raise RuntimeError(
+            "Designer produced {} planner-verified tasks out of {}; see task_attempts.jsonl".format(
+                len(tasks), len(entries)
+            )
+        )
+    return tasks
+
+
+def _short(value, limit):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def summarize_diagnostics(results, diagnostic_id, adapter_path):
+    cases = []
+    for index, result in enumerate(results):
+        trace = result["trace"]
+        seen = set()
+        repeated = 0
+        for step in trace:
+            if step["action"] in seen and step.get("stalled"):
+                repeated += 1
+            seen.add(step["action"])
+        navigation_stalls = sum(
+            step["action"].lower().startswith("go to ") and step.get("stalled") for step in trace
+        )
+        categories = []
+        if result["candidate_error"]:
+            categories.append("invalid_or_failed_action")
+        if repeated:
+            categories.append("repeated_action")
+        if navigation_stalls:
+            categories.append("stalled_navigation")
+        if not result["success"]:
+            categories.append("task_incomplete")
+        cases.append({
+            "ref": "{}/episode-{:03d}".format(diagnostic_id, index),
+            "scene_id": result["source_scene_id"],
+            "objective": _short(result.get("initial_observation"), 180),
+            "success": bool(result["success"]),
+            "goal_progress": result.get("goal_progress"),
+            "steps": result["steps"],
+            "categories": categories,
+            "candidate_error": _short(result.get("candidate_error"), 160),
+            "repeated_action_count": repeated,
+            "stalled_navigation_count": navigation_stalls,
+            "trace_tail": [{
+                "action": _short(step["action"], 100),
+                "observation": _short(step["observation"], 180),
+                "goal_progress": step.get("goal_progress"),
+                "stalled": bool(step.get("stalled")),
+            } for step in trace[-4:]],
+        })
+    failures = [case for case in cases if not case["success"]]
+    references = (failures or cases)[:4]
+    reference_ids = [case["ref"] for case in references] or [diagnostic_id + "/aggregate"]
+    category_counts = {}
+    for case in cases:
+        for category in case["categories"]:
+            category_counts[category] = category_counts.get(category, 0) + 1
+    return {
+        "diagnostic_id": diagnostic_id,
+        "solver_adapter": str(adapter_path) if adapter_path else "base",
+        "task_count": len(cases),
+        "success_count": len(cases) - len(failures),
+        "failure_count": len(failures),
+        "success_rate": (len(cases) - len(failures)) / len(cases),
+        "category_counts": category_counts,
+        "cases": references,
+        "reference_ids": reference_ids,
+        "required_reference_ids": reference_ids,
     }
 
 
-def edit_messages(service, task, result, feedback):
-    trace = [{"action": step["action"], "observation": step["observation"],
-              "goal_progress": step["goal_progress"]} for step in result["trace"]]
-    return [
-        {"role": "system", "content": (
-            "The frozen Solver failed this verified ALFWorld task. Reflect on the specific error by "
-            "comparing its failed trajectory with the planner's valid solution. Return exactly one "
-            "JSON object with one key, skill, whose value is one concise, reusable English instruction "
-            "that would help prevent this failure. Ground it in the observed failure; do not give a "
-            "generic task plan, scene-specific object names, numbered locations, or a list of rules.")},
-        {"role": "user", "content": json.dumps({
-            "current_skills": service["knowledge"],
-            "diagnostic_feedback": feedback, "experiment_hypothesis": task.hypothesis,
-            "task": task.instruction, "solver_success": result["success"],
-            "solver_error": result["candidate_error"], "solver_trace": trace,
-            "verified_plan": task.witness_actions,
-        }, ensure_ascii=False)},
-    ]
-
-
-def parse_skill(text):
-    text = text.strip()
-    if text.startswith("```json") and text.endswith("```"):
-        text = text[7:-3].strip()
-    data = json.loads(text)
-    if set(data) != {"skill"} or not isinstance(data["skill"], str) or not data["skill"].strip():
-        raise ValueError("Editor must return one nonempty skill string")
-    return data["skill"].strip()
+def prepare_period(executor, config, adapter_path, allocation, output, period, attempts):
+    period_dir = output / "period-{:02d}".format(period)
+    period_dir.mkdir()
+    write_json(period_dir / "solver_parent.json", {"adapter": str(adapter_path) if adapter_path else "base"})
+    diagnostic_entries = [{**entry, "split": "train"} for entry in allocation["diagnostic"]]
+    diagnostic = evaluate(executor, diagnostic_entries, 50000 + period * 1000)
+    write_jsonl(period_dir / "diagnostic_episodes.jsonl", diagnostic["results"])
+    feedback = summarize_diagnostics(
+        diagnostic["results"], "period-{:02d}-diagnostic".format(period), adapter_path
+    )
+    write_json(period_dir / "diagnostic_feedback.json", feedback)
+    tasks = design_tasks(
+        executor, config, feedback, allocation["tasks"], period_dir, period, attempts
+    )
+    examples = collect_solver_sft_examples(config, tasks)
+    write_jsonl(period_dir / "solver_sft.jsonl", examples)
+    write_json(period_dir / "period_input.json", {
+        "solver_adapter": str(adapter_path) if adapter_path else "base",
+        "diagnostics": feedback,
+        "verified_task_count": len(tasks),
+        "sft_action_count": len(examples),
+        "task_ids": [task.task_id for task in tasks],
+    })
+    return period_dir, tasks, examples, diagnostic
 
 
 def main():
@@ -369,213 +416,116 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--periods", type=int, default=3)
-    parser.add_argument("--experiments", type=int, default=4)
+    parser.add_argument("--periods", type=int, default=1)
+    parser.add_argument("--tasks", type=int, default=20)
     parser.add_argument("--diagnostics", type=int, default=10)
-    parser.add_argument("--selection", type=int, default=8)
     parser.add_argument("--id-test", type=int, default=8)
     parser.add_argument("--ood-test", type=int, default=4)
     parser.add_argument("--attempts", type=int, default=4)
     parser.add_argument("--gpus", type=int, default=2)
+    parser.add_argument("--train-device", default="cuda:0")
     parser.add_argument("--manifest")
-    parser.add_argument("--resume-from")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+    if args.attempts < 1 or args.gpus < 1:
+        raise ValueError("attempts and gpus must be positive")
     config = load_config(args.config)
     config["model"].update({"path": args.model, "revision": "local"})
     manifest = (json.loads(Path(args.manifest).read_text(encoding="utf-8")) if args.manifest else
-                make_manifest(config, args.periods, args.diagnostics, args.experiments,
-                              args.selection, args.id_test, args.ood_test))
-    previous = Path(args.resume_from).resolve() if args.resume_from else None
-    if previous:
-        previous_contract = json.loads((previous / "contract.json").read_text(encoding="utf-8"))
-        if (previous_contract.get("solver_action_mode") != "direct_full_admissible_commands"
-                or previous_contract.get("task_protocol") != "failure_gated_multi_goal_v1"):
-            raise ValueError("cannot resume a run with a different Solver or task-generation protocol")
+                make_manifest(config, args.periods, args.diagnostics, args.tasks,
+                              args.id_test, args.ood_test))
     output = Path(args.out).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    if args.resume_from:
-        for name in ("initial_service.json", "initial_test.json", "initial_selection.json"):
-            shutil.copy2(previous / name, output / name)
-        old_period = previous / "period-01"
-        resumed_period = output / "period-01"
-        shutil.copytree(old_period, resumed_period)
-        prior_candidates = resumed_period / "editor_candidates.json"
-        if prior_candidates.exists():
-            prior_candidates.rename(resumed_period / "editor_candidates-first-attempt.json")
-        resumed_tasks = read_tasks(resumed_period / "tasks.jsonl")
-        for task in resumed_tasks:
-            task.task_game_file = str(resumed_period / Path(task.task_game_file).relative_to(old_period))
-        write_tasks(resumed_period / "tasks.jsonl", resumed_tasks)
     write_json(output / "manifest.json", manifest)
-    write_json(output / "contract.json", {"arguments": vars(args), "config": config,
-        "method": "frozen_models_skills", "selection_policy": "strictly higher paired success rate",
-        "planner": "TextWorld Fast Downward plus ALFWorld replay", "weights_updated": False,
-        "solver_action_mode": "direct_full_admissible_commands",
-        "task_protocol": "failure_gated_multi_goal_v1",
-        "skill_trigger": "reflect only after a Solver task failure"})
+    write_json(output / "contract.json", {
+        "arguments": vars(args),
+        "config": config,
+        "method": "failure_conditioned_designer_planner_supervised_solver_sft",
+        "designer": {"weights_updated": False, "uses_solver_adapter": False},
+        "solver": {"base_model": args.model, "training": "LoRA SFT from planner-replayed actions"},
+        "planner": "TextWorld Fast Downward plus ALFWorld replay",
+        "selection_pool": False,
+        "editor_skills_policy": False,
+        "sft_prompt_schema": ["task", "observation", "recent_actions", "allowed_commands", "remaining_steps"],
+    })
     if args.prepare_only:
         log("scene allocation complete: {}".format(output))
         return
-    if args.resume_from:
-        service = json.loads((output / "initial_service.json").read_text(encoding="utf-8"))
-    else:
-        seed_service = json.loads(Path("seeds/service.json").read_text(encoding="utf-8"))
-        service = {"knowledge": seed_service["knowledge"]}
-    initial_service = copy.deepcopy(service)
-    write_json(output / "initial_service.json", initial_service)
-    context = mp.get_context("spawn")
-    devices = context.Queue()
-    for device in range(args.gpus):
-        devices.put(device)
-    with ProcessPoolExecutor(max_workers=args.gpus, mp_context=context,
-                             initializer=init_worker, initargs=(config, devices)) as executor:
-        if args.resume_from:
-            initial_test = json.loads((output / "initial_test.json").read_text(encoding="utf-8"))
-            initial_id, initial_ood = initial_test["id"], initial_test["ood"]
-            parent_selection = json.loads((output / "initial_selection.json").read_text(encoding="utf-8"))
-            log("reusing completed initial tests, diagnosis, and verified first-period tasks")
-        else:
-            log("evaluating initial ID/OOD tests")
-            initial_id = evaluate(executor, service, manifest["id_test"], 910000)
-            initial_ood = evaluate(executor, service, manifest["ood_test"], 920000)
-            write_json(output / "initial_test.json", {"id": initial_id, "ood": initial_ood})
-            parent_selection = evaluate(executor, service, manifest["selection"], 900000)
-            write_json(output / "initial_selection.json", parent_selection)
-        history = []
-        period_summaries = []
-        for index, allocation in enumerate(manifest["periods"]):
-            period = index + 1
-            period_dir = output / "period-{:02d}".format(period)
-            period_dir.mkdir(exist_ok=bool(args.resume_from and period == 1))
-            service_path = period_dir / "parent.json"
-            write_json(service_path, service)
-            if args.resume_from and period == 1:
-                diagnostic_summary = json.loads((period_dir / "diagnostic_summary.json").read_text(encoding="utf-8"))
-                diagnostic = {"success_rate": diagnostic_summary["success_count"] / diagnostic_summary["task_count"]}
-                feedback = json.loads((period_dir / "research_feedback.json").read_text(encoding="utf-8"))
-                tasks = read_tasks(period_dir / "tasks.jsonl")
-                task_results = json.loads((period_dir / "solver_experiments.json").read_text(encoding="utf-8"))
-                if len(task_results["results"]) != len(tasks):
-                    raise ValueError("the resumed period has mismatched tasks and Solver results")
-            else:
-                log("period {}: diagnosing {} scenes".format(period, len(allocation["diagnostic"])))
-                diagnostic_entries = [{**row, "split": "train"} for row in allocation["diagnostic"]]
-                diagnostic = evaluate(executor, service, diagnostic_entries, 50000 + period * 1000)
-                diagnostic_id = "period-{:02d}-diagnostic".format(period)
-                for i, result in enumerate(diagnostic["results"]):
-                    result["episode_id"] = "{}-episode-{:03d}".format(diagnostic_id, i)
-                write_jsonl(period_dir / "diagnostic_episodes.jsonl", diagnostic["results"])
-                diagnostic_summary = summarize_diagnostic_results(diagnostic["results"], diagnostic_id, service_path)
-                write_json(period_dir / "diagnostic_summary.json", diagnostic_summary)
-                feedback = {"current_solver_diagnostics": diagnostic_summary, "prior_research": history[-2:],
-                            "reference_ids": diagnostic_summary["reference_ids"],
-                            "required_reference_ids": diagnostic_summary["reference_ids"]}
-                write_json(period_dir / "research_feedback.json", feedback)
-                tasks, task_results = design_tasks(
-                    executor, config, service, feedback, allocation["experiment"],
-                    period_dir, period, args.attempts,
-                )
-                write_tasks(period_dir / "tasks.jsonl", tasks)
-                write_json(period_dir / "solver_experiments.json", task_results)
-            candidates = []
-            jobs = []
-            for i, (task, result) in enumerate(zip(tasks, task_results["results"])):
-                if result["success"]:
-                    candidates.append({"experiment_id": task.experiment_id,
-                                       "reflection_status": "skipped_solver_succeeded"})
-                    continue
-                if result["candidate_error"]:
-                    candidates.append({"experiment_id": task.experiment_id,
-                                       "reflection_status": "skipped_execution_error",
-                                       "error": result["candidate_error"]})
-                    continue
-                job = {"messages": edit_messages(service, task, result, feedback),
-                       "seed": 80000 + period * 1000 + i, "max_new_tokens": 768,
-                       "task_index": i}
-                jobs.append(job)
-                candidates.append({"experiment_id": task.experiment_id,
-                                   "task_id": task.task_id, "reflection_status": "pending"})
-            outputs = list(executor.map(worker_generate, jobs))
-            for job, text in zip(jobs, outputs):
-                i = job["task_index"]
-                row = candidates[i]
-                row.update({"prompt": job["messages"], "output": text})
-                try:
-                    skill = parse_skill(text)
-                except (json.JSONDecodeError, ValueError, TypeError) as error:
-                    row["error"] = str(error)
-                else:
-                    row["skill"] = skill
-                    if skill in service["knowledge"]:
-                        row["reflection_status"] = "duplicate_skill"
-                    else:
-                        row["knowledge"] = service["knowledge"] + [skill]
-                        row["reflection_status"] = "skill_proposed"
-            write_json(period_dir / "editor_candidates.json", candidates)
-            best = None
-            scored_knowledge = {}
-            log("period {}: evaluating {} failure-grounded skill proposals".format(
-                period, sum("skill" in candidate for candidate in candidates)))
-            for i, candidate in enumerate(candidates):
-                if "knowledge" not in candidate:
-                    continue
-                if candidate["knowledge"] == service["knowledge"]:
-                    candidate["no_change"] = True
-                    continue
-                proposed = {"knowledge": candidate["knowledge"]}
-                task = tasks[i]
-                task_entry = {"scene": task.source_scene_id, "game": task.task_game_file,
-                              "split": task.source_split, "task": task}
-                repair = evaluate(executor, proposed, [task_entry], 73000 + period * 1000 + i)
-                candidate["triggering_task_repair"] = repair
-                if not repair["results"][0]["success"]:
-                    candidate["selection_skipped"] = "skill_did_not_repair_triggering_failure"
-                    write_json(period_dir / "editor_candidates.json", candidates)
-                    continue
-                candidate["triggering_task_repaired"] = True
-                knowledge_key = tuple(candidate["knowledge"])
-                if knowledge_key not in scored_knowledge:
-                    scored_knowledge[knowledge_key] = evaluate(executor, proposed, manifest["selection"], 900000)
-                score = scored_knowledge[knowledge_key]
-                candidate["selection"] = score
-                candidate["selection_delta"] = score["success_rate"] - parent_selection["success_rate"]
-                write_json(period_dir / "editor_candidates.json", candidates)
-                if score["success_rate"] > parent_selection["success_rate"] and (best is None or score["success_rate"] > best["selection"]["success_rate"]):
-                    best = candidate
-            before = parent_selection["success_rate"]
-            if best is not None:
-                service = {"knowledge": best["knowledge"]}
-                parent_selection = best["selection"]
-            summary = {"period": period, "diagnostic_success_rate": diagnostic["success_rate"],
-                       "verified_tasks": len(tasks), "baseline_solver_failures": len(tasks),
-                       "skill_proposals": sum("skill" in candidate for candidate in candidates),
-                       "triggering_task_repairs": sum(candidate.get("triggering_task_repaired", False)
-                                                       for candidate in candidates),
-                       "selection_before": before, "selection_after": parent_selection["success_rate"],
-                       "accepted_experiment": best["experiment_id"] if best else None,
-                       "knowledge": service["knowledge"]}
-            write_json(period_dir / "service.json", service)
-            write_json(period_dir / "summary.json", summary)
-            history.append({"period": period, "summary": summary,
-                            "hypotheses": [task.hypothesis for task in tasks],
-                            "candidate_effects": [{"experiment_id": item["experiment_id"],
-                                                   "selection_delta": item.get("selection_delta"),
-                                                   "triggering_task_repaired": item.get("triggering_task_repaired"),
-                                                   "error": item.get("error")} for item in candidates]})
+
+    with worker_pool(config, args.gpus, None) as executor:
+        log("evaluating initial Solver on fixed ID/OOD test sets")
+        initial_id = evaluate(executor, manifest["id_test"], 910000)
+        initial_ood = evaluate(executor, manifest["ood_test"], 920000)
+        write_json(output / "initial_test.json", {"id": initial_id, "ood": initial_ood})
+        first_dir, tasks, examples, diagnostic = prepare_period(
+            executor, config, None, manifest["periods"][0], output, 1, args.attempts
+        )
+
+    period_summaries = []
+    current_adapter = None
+    parent_id, parent_ood = initial_id, initial_ood
+    prepared = (first_dir, tasks, examples, diagnostic)
+    for period_index, allocation in enumerate(manifest["periods"]):
+        period = period_index + 1
+        period_dir, tasks, examples, diagnostic = prepared
+        adapter_dir = period_dir / "solver_adapter"
+        log("period {}: training Solver LoRA on {} planner actions from {} tasks".format(
+            period, len(examples), len(tasks)))
+        train_solver_sft(
+            config,
+            period_dir / "solver_sft.jsonl",
+            adapter_dir,
+            parent_adapter=current_adapter,
+            device=args.train_device,
+        )
+        current_adapter = adapter_dir
+        with worker_pool(config, args.gpus, current_adapter) as executor:
+            id_test = evaluate(executor, manifest["id_test"], 910000)
+            ood_test = evaluate(executor, manifest["ood_test"], 920000)
+            write_json(period_dir / "test_results.json", {"id": id_test, "ood": ood_test})
+            summary = {
+                "period": period,
+                "diagnostic_success_rate": diagnostic["success_rate"],
+                "verified_tasks": len(tasks),
+                "sft_action_count": len(examples),
+                "solver_adapter": str(current_adapter),
+                "id_success_rate": id_test["success_rate"],
+                "ood_success_rate": ood_test["success_rate"],
+                "id_delta_from_parent": id_test["success_rate"] - parent_id["success_rate"],
+                "ood_delta_from_parent": ood_test["success_rate"] - parent_ood["success_rate"],
+                "id_delta_from_initial": id_test["success_rate"] - initial_id["success_rate"],
+                "ood_delta_from_initial": ood_test["success_rate"] - initial_ood["success_rate"],
+            }
+            parent_id, parent_ood = id_test, ood_test
             period_summaries.append(summary)
-            log("period {} complete: {}".format(period, json.dumps(summary, ensure_ascii=False)))
-        log("evaluating final ID/OOD tests")
-        final_id = evaluate(executor, service, manifest["id_test"], 910000)
-        final_ood = evaluate(executor, service, manifest["ood_test"], 920000)
-        result = {"periods": period_summaries, "initial_id": initial_id, "final_id": final_id,
-                  "initial_ood": initial_ood, "final_ood": final_ood,
-                  "id_success_rate_delta": final_id["success_rate"] - initial_id["success_rate"],
-                  "ood_success_rate_delta": final_ood["success_rate"] - initial_ood["success_rate"],
-                  "initial_service": initial_service, "final_service": service}
-        write_json(output / "result.json", result)
-        log("completed: ID {:.3f} -> {:.3f}; OOD {:.3f} -> {:.3f}".format(
-            initial_id["success_rate"], final_id["success_rate"], initial_ood["success_rate"], final_ood["success_rate"]))
+            write_json(period_dir / "summary.json", summary)
+            log("period {} complete: ID {:.3f} ({:+.3f}), OOD {:.3f} ({:+.3f})".format(
+                period, summary["id_success_rate"], summary["id_delta_from_initial"],
+                summary["ood_success_rate"], summary["ood_delta_from_initial"]))
+            if period < len(manifest["periods"]):
+                prepared = prepare_period(
+                    executor, config, current_adapter, manifest["periods"][period],
+                    output, period + 1, args.attempts,
+                )
+
+    final_id = json.loads((output / "period-{:02d}".format(len(period_summaries)) /
+                           "test_results.json").read_text(encoding="utf-8"))["id"]
+    final_ood = json.loads((output / "period-{:02d}".format(len(period_summaries)) /
+                            "test_results.json").read_text(encoding="utf-8"))["ood"]
+    result = {
+        "initial_id": initial_id,
+        "final_id": final_id,
+        "initial_ood": initial_ood,
+        "final_ood": final_ood,
+        "id_success_rate_delta": final_id["success_rate"] - initial_id["success_rate"],
+        "ood_success_rate_delta": final_ood["success_rate"] - initial_ood["success_rate"],
+        "periods": period_summaries,
+        "final_solver_adapter": str(current_adapter),
+    }
+    write_json(output / "result.json", result)
+    log("completed: ID {:.3f} -> {:.3f}; OOD {:.3f} -> {:.3f}".format(
+        initial_id["success_rate"], final_id["success_rate"],
+        initial_ood["success_rate"], final_ood["success_rate"]))
 
 
 if __name__ == "__main__":
