@@ -131,7 +131,7 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                 observation = replace_native_objective(observation, objective)
             policy_view = make_policy_view(
                 observation,
-                objective,
+                objective if task else native_objective,
                 history,
                 view["admissible_commands"],
                 service["knowledge"],
@@ -142,23 +142,32 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
             except CandidateExecutionError as error:
                 candidate_error = str(error)
                 break
-            generation = None
-            if directive["kind"] == "model":
-                generation = model.generate(
-                    directive["messages"],
-                    max_new_tokens=config["model"]["max_new_tokens"],
-                    temperature=config["model"]["temperature"],
-                    top_p=config["model"]["top_p"],
-                )
-                selection = generation["generated_text"].strip()
-            else:
-                selection = directive["action"].strip()
             action_choices = policy_state.get("action_choices", view["admissible_commands"])
             if not isinstance(action_choices, list) or not all(
                 isinstance(choice, str) for choice in action_choices
             ):
                 candidate_error = "policy state action_choices must be a list of command strings"
                 break
+            generation = None
+            if directive["kind"] == "model":
+                allowed = (
+                    [str(index + 1) for index, choice in enumerate(action_choices)
+                     if choice in view["admissible_commands"]]
+                    if "action_choices" in policy_state else view["admissible_commands"]
+                )
+                if not allowed:
+                    candidate_error = "policy has no admissible model action choices"
+                    break
+                generation = model.generate(
+                    directive["messages"],
+                    max_new_tokens=config["model"]["max_new_tokens"],
+                    temperature=config["model"]["temperature"],
+                    top_p=config["model"]["top_p"],
+                    allowed_texts=allowed,
+                )
+                selection = generation["generated_text"].strip()
+            else:
+                selection = directive["action"].strip()
             if directive["kind"] == "model" and re.fullmatch(r"\d+", selection) and not action_choices:
                 candidate_error = "numbered model output cannot be resolved because action_choices is empty"
                 break

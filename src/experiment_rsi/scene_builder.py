@@ -142,8 +142,8 @@ def build_scene(source_game_file, spec, output_dir):
     game_file.write_text(json.dumps(game, ensure_ascii=False), encoding="utf-8")
     return {"task_id": task_id, "game_file": str(game_file), "source_game_file": str(source),
             "source_scene_id": scene_id, "source_goal_text": source_goal,
-            "instruction": "Put {} {} object{} in {} {}.".format(
-                count, object_type, "" if count == 1 else "s", destination_type,
+            "instruction": "Put {} {} in {} {}.".format(
+                count, object_type, destination_type,
                 len(scene["receptacles"][destination_type]) - scene["receptacles"][destination_type].index(destination_id)),
             "goal_atoms": goal_atoms, "object_ids": selected, "initial_receptacle_id": initial_id,
             "destination_id": destination_id, "spec": spec}

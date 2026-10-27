@@ -121,7 +121,7 @@ class ModelSession:
             sampling["max_new_tokens"] = max(len(token_ids) for token_ids in tokenized_texts) + 1
             sampling["prefix_allowed_tokens_fn"] = prefix_allowed_tokens
         with torch.no_grad():
-            output = self.model.generate(prompt_ids, **sampling)
+            output = self.model.generate(prompt_ids, attention_mask=torch.ones_like(prompt_ids), **sampling)
         generated_ids = output.sequences[:, prompt_ids.shape[1]:]
         transition = self.model.compute_transition_scores(
             output.sequences, output.scores, normalize_logits=True
