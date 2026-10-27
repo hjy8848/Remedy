@@ -12,13 +12,12 @@ from pathlib import Path
 
 from experiment_rsi.alfworld import AlfworldEpisode, list_game_files
 from experiment_rsi.config import load_config
-from experiment_rsi.constructed import _parse_spec, _spec_messages
+from experiment_rsi.constructed import _parse_spec
 from experiment_rsi.evaluation import run_episode
 from experiment_rsi.model import ModelSession, seed_everything
-from experiment_rsi.policy import load_service
 from experiment_rsi.records import SyntheticTask
 from experiment_rsi.research import summarize_diagnostic_results
-from experiment_rsi.scene_builder import build_scene
+from experiment_rsi.scene_builder import build_scene, inspect_scene
 from experiment_rsi.synthesis import (
     goal_reached, pddl_goal_expression, read_tasks, replay_witness, source_scene_id,
     supported_placement_game, write_tasks,
@@ -116,13 +115,15 @@ def worker_episode(job):
     result = run_episode(
         config, job["service"], _MODEL, job["game"], task=job.get("task"),
         max_steps=config["run"]["max_steps"], seed=job["seed"],
+        action_mode=job["action_mode"],
     )
     result["source_scene_id"] = job["scene"]
     return result
 
 
 def evaluate(executor, service, entries, seed):
-    jobs = [{**entry, "service": service, "seed": seed + i} for i, entry in enumerate(entries)]
+    jobs = [{**entry, "service": service, "seed": seed + i, "action_mode": "direct"}
+            for i, entry in enumerate(entries)]
     results = []
     for result in executor.map(worker_episode, jobs):
         results.append(result)
@@ -134,6 +135,39 @@ def evaluate(executor, service, entries, seed):
             "success_rate": success / len(results),
             "model_action_calls": sum(step["policy_kind"] == "model" for result in results for step in result["trace"]),
             "results": results}
+
+
+def skill_task_messages(game_file, service, feedback):
+    game = json.loads(Path(game_file).read_text(encoding="utf-8"))
+    scene = inspect_scene(game["pddl_problem"])
+    containments = sorted({(args[0].removesuffix("type"), args[1].removesuffix("type"))
+                           for predicate, args in scene["facts"] if predicate == "cancontain"
+                           and len(args) == 2 and args[0].removesuffix("type") in scene["receptacles"]
+                           and args[1].removesuffix("type") in scene["objects"]})
+    return [
+        {"role": "system", "content": (
+            "Design an ALFWorld placement experiment that directly challenges a failure in the "
+            "supplied Solver feedback. Return JSON with hypothesis, diagnostic_behavior, "
+            "feedback_refs, base_scene, objects, and goal. Use the provided base_scene. "
+            "objects is a list of one to three distinct object types; each entry has type, count "
+            "(1 to 3), and initial_receptacle. goal has type 'place_all' and a placements list "
+            "with exactly one entry per object type; each entry has object_type, count, and "
+            "destination_type. Counts must match objects. Cite at least one supplied feedback "
+            "reference. Use only listed object, receptacle, "
+            "and containment types. Make the task challenging enough to expose the cited Solver "
+            "weakness; do not favor one-object, shortest-path, or otherwise easy tasks. Use multiple "
+            "objects, goals, or container interactions when they test that weakness. Do not write PDDL; "
+            "the host planner and ALFWorld replay will validate the task.")},
+        {"role": "user", "content": json.dumps({
+            "base_scene": source_scene_id(game_file),
+            "current_knowledge": service["knowledge"],
+            "research_feedback": feedback,
+            "pickupable_object_types": sorted(scene["objects"]),
+            "receptacle_counts": {key: len(value) for key, value in scene["receptacles"].items()},
+            "can_contain": [{"receptacle": receptacle, "object": object_type}
+                            for receptacle, object_type in containments],
+        }, ensure_ascii=False)},
+    ]
 
 
 def _planner_worker(config, scene, result_queue):
@@ -173,8 +207,13 @@ def plan_task(config, scene, spec, experiment_id):
         source_goal_text=scene["source_goal_text"], custom_goal_text=pddl_goal_expression(scene["goal_atoms"]),
         witness_actions=actions, source_split="train", experiment_id=experiment_id,
         hypothesis_id=experiment_id + "/hypothesis", hypothesis=spec["hypothesis"],
-        feedback_refs=spec["feedback_refs"], diagnostic_target={"object": spec["goal"]["object_type"],
-                                                                 "receptacle": spec["goal"]["destination_type"]},
+        feedback_refs=spec["feedback_refs"], diagnostic_target={
+            "placements": [
+                {"object": item["object_type"], "count": item["count"],
+                 "receptacle": item["destination_type"]}
+                for item in scene["placements"]
+            ]
+        },
         generation_mode="constructed", experiment_spec=spec,
     )
     replay = replay_witness(config, task)
@@ -183,24 +222,37 @@ def plan_task(config, scene, spec, experiment_id):
     return task, replay
 
 
+def _compact_solver_result(result):
+    return {
+        "success": result["success"],
+        "candidate_error": result["candidate_error"],
+        "steps": result["steps"],
+        "goal_progress": result["goal_progress"],
+        "trace": [{"action": step["action"], "observation": step["observation"],
+                   "goal_progress": step["goal_progress"]} for step in result["trace"]],
+    }
+
+
 def design_tasks(executor, config, service, feedback, entries, output, period, attempts):
     pending = list(range(len(entries)))
     accepted = {}
+    accepted_results = {}
     records = []
-    errors = {}
+    revision_feedback = {}
     for attempt in range(attempts):
         if not pending:
             break
         jobs = []
         for index in pending:
-            messages = _spec_messages(entries[index]["game"], service, feedback)
-            messages.append({"role": "user", "content": "Prefer a simple task with one object so the experiment isolates one behavior."})
-            if index in errors:
-                messages.append({"role": "user", "content": "Your previous proposal was rejected: {}. Correct the JSON using the available types and containment pairs.".format(errors[index])})
+            messages = skill_task_messages(entries[index]["game"], service, feedback)
+            if index in revision_feedback:
+                messages.append({"role": "user", "content": revision_feedback[index]})
             jobs.append({"messages": messages, "seed": config["run"]["seed"] + period * 1000 + attempt * 100 + index,
                          "max_new_tokens": 768})
         outputs = list(executor.map(worker_generate, jobs))
         remaining = []
+        proposed = []
+        attempt_records = []
         for index, job, output_text in zip(pending, jobs, outputs):
             experiment_id = "period-{:02d}/experiment-{:02d}".format(period, index + 1)
             record = {"experiment_id": experiment_id, "source_scene_id": entries[index]["scene"],
@@ -210,21 +262,76 @@ def design_tasks(executor, config, service, feedback, entries, output, period, a
                 scene = build_scene(entries[index]["game"], spec, output / "task_games")
                 task, replay = plan_task(config, scene, spec, experiment_id)
             except (json.JSONDecodeError, ValueError, KeyError, TypeError) as error:
-                errors[index] = str(error)
+                revision_feedback[index] = (
+                    "The previous proposal was rejected: {}. Correct the task specification, "
+                    "while keeping it challenging and tied to the diagnostic behavior."
+                ).format(error)
                 record["rejection_reason"] = str(error)
                 remaining.append(index)
+                attempt_records.append(record)
             else:
                 record.update({"spec": spec, "task": asdict(task), "witness_replay": replay,
                                "witness_source": "host_fast_downward"})
-                accepted[index] = task
-            records.append(record)
-            log("period {} task {} attempt {}: {}".format(period, index + 1, attempt + 1,
-                record.get("rejection_reason", "verified")))
+                proposed.append((index, task, record))
+        if proposed:
+            attempt_entries = [{"scene": task.source_scene_id, "game": task.task_game_file,
+                                "split": task.source_split, "task": task}
+                               for _, task, _ in proposed]
+            attempt_results = evaluate(
+                executor, service, attempt_entries,
+                60000 + period * 10000 + attempt * 1000,
+            )
+            for (index, task, record), result in zip(proposed, attempt_results["results"]):
+                record["solver_attempt"] = _compact_solver_result(result)
+                if result["candidate_error"]:
+                    record["rejection_reason"] = "solver_execution_error"
+                    attempt_records.append(record)
+                    records.extend(attempt_records)
+                    write_jsonl(output / "task_attempts.jsonl", records)
+                    raise RuntimeError(
+                        "Solver execution failed while validating a proposed challenge: {}".format(
+                            result["candidate_error"]
+                        )
+                    )
+                if result["success"]:
+                    record["rejection_reason"] = "baseline_solver_solved_task"
+                    revision_feedback[index] = (
+                        "The unchanged Solver solved your previous planner-verified task in {} "
+                        "steps. Propose a materially more challenging task that still tests the "
+                        "same diagnostic behavior; do not merely rename objects or locations."
+                    ).format(result["steps"])
+                    remaining.append(index)
+                else:
+                    record["rejection_reason"] = None
+                    accepted[index] = task
+                    accepted_results[index] = result
+                attempt_records.append(record)
+        records.extend(attempt_records)
+        for record in attempt_records:
+            log("period {} task {} attempt {}: {}".format(
+                period, record["experiment_id"], attempt + 1,
+                record.get("rejection_reason", "verified failure challenge")))
         write_jsonl(output / "task_attempts.jsonl", records)
         pending = remaining
-    if pending:
-        raise RuntimeError("could not produce four verified tasks; see task_attempts.jsonl")
-    return [accepted[index] for index in range(len(entries))]
+    for index in pending:
+        experiment_id = "period-{:02d}/experiment-{:02d}".format(period, index + 1)
+        for record in reversed(records):
+            if record["experiment_id"] == experiment_id:
+                record["final_status"] = "no_solver_failure_found_after_attempts"
+                break
+    write_jsonl(output / "task_attempts.jsonl", records)
+    tasks = [accepted[index] for index in sorted(accepted)]
+    results = [accepted_results[index] for index in sorted(accepted)]
+    success_count = sum(result["success"] for result in results)
+    return tasks, {
+        "success_count": success_count,
+        "task_count": len(results),
+        "success_rate": success_count / len(results) if results else None,
+        "model_action_calls": sum(
+            step["policy_kind"] == "model" for result in results for step in result["trace"]
+        ),
+        "results": results,
+    }
 
 
 def edit_messages(service, task, result, feedback):
@@ -232,15 +339,13 @@ def edit_messages(service, task, result, feedback):
               "goal_progress": step["goal_progress"]} for step in result["trace"]]
     return [
         {"role": "system", "content": (
-            "Improve the Solver by editing only its reusable knowledge rules. "
-            "Compare its diagnostic failures and experiment behavior with the verified plan. "
-            "Return a JSON object with exactly one key, knowledge, containing the complete list of "
-            "concrete English instructions for the Solver. Write an actual actionable rule grounded in "
-            "the observed behaviors, not a placeholder or a description of what a rule should be. "
-            "Preserve useful existing rules, avoid scene-specific object or numbered-location facts, "
-            "and propose at most one new or revised rule. The policy itself cannot be edited.")},
+            "The frozen Solver failed this verified ALFWorld task. Reflect on the specific error by "
+            "comparing its failed trajectory with the planner's valid solution. Return exactly one "
+            "JSON object with one key, skill, whose value is one concise, reusable English instruction "
+            "that would help prevent this failure. Ground it in the observed failure; do not give a "
+            "generic task plan, scene-specific object names, numbered locations, or a list of rules.")},
         {"role": "user", "content": json.dumps({
-            "current_knowledge": service["knowledge"], "policy_source": service["policy_source"],
+            "current_skills": service["knowledge"],
             "diagnostic_feedback": feedback, "experiment_hypothesis": task.hypothesis,
             "task": task.instruction, "solver_success": result["success"],
             "solver_error": result["candidate_error"], "solver_trace": trace,
@@ -249,18 +354,14 @@ def edit_messages(service, task, result, feedback):
     ]
 
 
-def parse_knowledge(text):
+def parse_skill(text):
     text = text.strip()
     if text.startswith("```json") and text.endswith("```"):
         text = text[7:-3].strip()
     data = json.loads(text)
-    if set(data) != {"knowledge"} or not isinstance(data["knowledge"], list):
-        raise ValueError("Editor must return an object with a knowledge list")
-    if not all(isinstance(rule, str) and rule.strip() for rule in data["knowledge"]):
-        raise ValueError("every knowledge rule must be nonempty text")
-    if any(rule.strip().lower() == "short actionable rule" for rule in data["knowledge"]):
-        raise ValueError("Editor copied a placeholder instead of writing an actual rule")
-    return data["knowledge"]
+    if set(data) != {"skill"} or not isinstance(data["skill"], str) or not data["skill"].strip():
+        raise ValueError("Editor must return one nonempty skill string")
+    return data["skill"].strip()
 
 
 def main():
@@ -285,10 +386,15 @@ def main():
     manifest = (json.loads(Path(args.manifest).read_text(encoding="utf-8")) if args.manifest else
                 make_manifest(config, args.periods, args.diagnostics, args.experiments,
                               args.selection, args.id_test, args.ood_test))
+    previous = Path(args.resume_from).resolve() if args.resume_from else None
+    if previous:
+        previous_contract = json.loads((previous / "contract.json").read_text(encoding="utf-8"))
+        if (previous_contract.get("solver_action_mode") != "direct_full_admissible_commands"
+                or previous_contract.get("task_protocol") != "failure_gated_multi_goal_v1"):
+            raise ValueError("cannot resume a run with a different Solver or task-generation protocol")
     output = Path(args.out).resolve()
     output.mkdir(parents=True, exist_ok=False)
     if args.resume_from:
-        previous = Path(args.resume_from).resolve()
         for name in ("initial_service.json", "initial_test.json", "initial_selection.json"):
             shutil.copy2(previous / name, output / name)
         old_period = previous / "period-01"
@@ -304,11 +410,18 @@ def main():
     write_json(output / "manifest.json", manifest)
     write_json(output / "contract.json", {"arguments": vars(args), "config": config,
         "method": "frozen_models_skills", "selection_policy": "strictly higher paired success rate",
-        "planner": "TextWorld Fast Downward plus ALFWorld replay", "weights_updated": False})
+        "planner": "TextWorld Fast Downward plus ALFWorld replay", "weights_updated": False,
+        "solver_action_mode": "direct_full_admissible_commands",
+        "task_protocol": "failure_gated_multi_goal_v1",
+        "skill_trigger": "reflect only after a Solver task failure"})
     if args.prepare_only:
         log("scene allocation complete: {}".format(output))
         return
-    service = load_service(output / "initial_service.json" if args.resume_from else "seeds/service.json")
+    if args.resume_from:
+        service = json.loads((output / "initial_service.json").read_text(encoding="utf-8"))
+    else:
+        seed_service = json.loads(Path("seeds/service.json").read_text(encoding="utf-8"))
+        service = {"knowledge": seed_service["knowledge"]}
     initial_service = copy.deepcopy(service)
     write_json(output / "initial_service.json", initial_service)
     context = mp.get_context("spawn")
@@ -343,8 +456,8 @@ def main():
                 feedback = json.loads((period_dir / "research_feedback.json").read_text(encoding="utf-8"))
                 tasks = read_tasks(period_dir / "tasks.jsonl")
                 task_results = json.loads((period_dir / "solver_experiments.json").read_text(encoding="utf-8"))
-                if len(tasks) != args.experiments or len(task_results["results"]) != len(tasks):
-                    raise ValueError("the resumed period does not contain the requested verified experiments")
+                if len(task_results["results"]) != len(tasks):
+                    raise ValueError("the resumed period has mismatched tasks and Solver results")
             else:
                 log("period {}: diagnosing {} scenes".format(period, len(allocation["diagnostic"])))
                 diagnostic_entries = [{**row, "split": "train"} for row in allocation["diagnostic"]]
@@ -359,39 +472,68 @@ def main():
                             "reference_ids": diagnostic_summary["reference_ids"],
                             "required_reference_ids": diagnostic_summary["reference_ids"]}
                 write_json(period_dir / "research_feedback.json", feedback)
-                tasks = design_tasks(executor, config, service, feedback, allocation["experiment"],
-                                     period_dir, period, args.attempts)
+                tasks, task_results = design_tasks(
+                    executor, config, service, feedback, allocation["experiment"],
+                    period_dir, period, args.attempts,
+                )
                 write_tasks(period_dir / "tasks.jsonl", tasks)
-                log("period {}: evaluating {} generated tasks".format(period, len(tasks)))
-                task_entries = [{"scene": task.source_scene_id, "game": task.task_game_file,
-                                 "split": "train", "task": task} for task in tasks]
-                task_results = evaluate(executor, service, task_entries, 70000 + period * 1000)
                 write_json(period_dir / "solver_experiments.json", task_results)
-            jobs = [{"messages": edit_messages(service, task, result, feedback),
-                     "seed": 80000 + period * 1000 + i, "max_new_tokens": 768}
-                    for i, (task, result) in enumerate(zip(tasks, task_results["results"]))]
-            outputs = list(executor.map(worker_generate, jobs))
             candidates = []
-            for i, (job, text) in enumerate(zip(jobs, outputs)):
-                row = {"experiment_id": tasks[i].experiment_id, "prompt": job["messages"], "output": text}
+            jobs = []
+            for i, (task, result) in enumerate(zip(tasks, task_results["results"])):
+                if result["success"]:
+                    candidates.append({"experiment_id": task.experiment_id,
+                                       "reflection_status": "skipped_solver_succeeded"})
+                    continue
+                if result["candidate_error"]:
+                    candidates.append({"experiment_id": task.experiment_id,
+                                       "reflection_status": "skipped_execution_error",
+                                       "error": result["candidate_error"]})
+                    continue
+                job = {"messages": edit_messages(service, task, result, feedback),
+                       "seed": 80000 + period * 1000 + i, "max_new_tokens": 768,
+                       "task_index": i}
+                jobs.append(job)
+                candidates.append({"experiment_id": task.experiment_id,
+                                   "task_id": task.task_id, "reflection_status": "pending"})
+            outputs = list(executor.map(worker_generate, jobs))
+            for job, text in zip(jobs, outputs):
+                i = job["task_index"]
+                row = candidates[i]
+                row.update({"prompt": job["messages"], "output": text})
                 try:
-                    knowledge = parse_knowledge(text)
+                    skill = parse_skill(text)
                 except (json.JSONDecodeError, ValueError, TypeError) as error:
                     row["error"] = str(error)
                 else:
-                    row["knowledge"] = knowledge
-                candidates.append(row)
+                    row["skill"] = skill
+                    if skill in service["knowledge"]:
+                        row["reflection_status"] = "duplicate_skill"
+                    else:
+                        row["knowledge"] = service["knowledge"] + [skill]
+                        row["reflection_status"] = "skill_proposed"
             write_json(period_dir / "editor_candidates.json", candidates)
             best = None
             scored_knowledge = {}
-            log("period {}: evaluating {} candidate skills on selection".format(period, len(candidates)))
+            log("period {}: evaluating {} failure-grounded skill proposals".format(
+                period, sum("skill" in candidate for candidate in candidates)))
             for i, candidate in enumerate(candidates):
                 if "knowledge" not in candidate:
                     continue
                 if candidate["knowledge"] == service["knowledge"]:
                     candidate["no_change"] = True
                     continue
-                proposed = {"policy_source": service["policy_source"], "knowledge": candidate["knowledge"]}
+                proposed = {"knowledge": candidate["knowledge"]}
+                task = tasks[i]
+                task_entry = {"scene": task.source_scene_id, "game": task.task_game_file,
+                              "split": task.source_split, "task": task}
+                repair = evaluate(executor, proposed, [task_entry], 73000 + period * 1000 + i)
+                candidate["triggering_task_repair"] = repair
+                if not repair["results"][0]["success"]:
+                    candidate["selection_skipped"] = "skill_did_not_repair_triggering_failure"
+                    write_json(period_dir / "editor_candidates.json", candidates)
+                    continue
+                candidate["triggering_task_repaired"] = True
                 knowledge_key = tuple(candidate["knowledge"])
                 if knowledge_key not in scored_knowledge:
                     scored_knowledge[knowledge_key] = evaluate(executor, proposed, manifest["selection"], 900000)
@@ -403,10 +545,13 @@ def main():
                     best = candidate
             before = parent_selection["success_rate"]
             if best is not None:
-                service = {"policy_source": service["policy_source"], "knowledge": best["knowledge"]}
+                service = {"knowledge": best["knowledge"]}
                 parent_selection = best["selection"]
             summary = {"period": period, "diagnostic_success_rate": diagnostic["success_rate"],
-                       "verified_tasks": len(tasks), "solver_experiment_success_rate": task_results["success_rate"],
+                       "verified_tasks": len(tasks), "baseline_solver_failures": len(tasks),
+                       "skill_proposals": sum("skill" in candidate for candidate in candidates),
+                       "triggering_task_repairs": sum(candidate.get("triggering_task_repaired", False)
+                                                       for candidate in candidates),
                        "selection_before": before, "selection_after": parent_selection["success_rate"],
                        "accepted_experiment": best["experiment_id"] if best else None,
                        "knowledge": service["knowledge"]}
@@ -416,6 +561,7 @@ def main():
                             "hypotheses": [task.hypothesis for task in tasks],
                             "candidate_effects": [{"experiment_id": item["experiment_id"],
                                                    "selection_delta": item.get("selection_delta"),
+                                                   "triggering_task_repaired": item.get("triggering_task_repaired"),
                                                    "error": item.get("error")} for item in candidates]})
             period_summaries.append(summary)
             log("period {} complete: {}".format(period, json.dumps(summary, ensure_ascii=False)))

@@ -1,5 +1,7 @@
+import json
 import re
 import statistics
+from contextlib import nullcontext
 
 from .alfworld import AlfworldEpisode
 from .model import seed_everything
@@ -99,7 +101,10 @@ def resolve_action(selection, admissible_commands, action_choices):
     return selection
 
 
-def run_episode(config, service, model, game_file, task=None, max_steps=None, seed=None):
+def run_episode(config, service, model, game_file, task=None, max_steps=None, seed=None,
+                action_mode="policy"):
+    if action_mode not in {"policy", "direct"}:
+        raise ValueError("action_mode must be 'policy' or 'direct'")
     task_split = task.source_split if task else config["alfworld"]["split"]
     objective = task.instruction if task else None
     history = []
@@ -110,11 +115,15 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
     candidate_error = None
     step_budget = max_steps if max_steps is not None else config["run"]["max_steps"]
     policy_seed = config["run"]["seed"] if seed is None else seed
+    policy_worker = (
+        PolicyWorker(service, config["worker"], policy_seed)
+        if action_mode == "policy" else nullcontext(None)
+    )
     with AlfworldEpisode(
         config["alfworld"]["config_path"],
         game_file=task.task_game_file if task else game_file,
         split=task_split,
-    ) as env, PolicyWorker(service, config["worker"], policy_seed) as worker:
+    ) as env, policy_worker as worker:
         view = env.reset()
         initial_observation = view["observation"]
         native_objective = view["observation"] if task is None else None
@@ -129,19 +138,48 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
             observation = view["observation"]
             if objective:
                 observation = replace_native_objective(observation, objective)
-            policy_view = make_policy_view(
-                observation,
-                objective if task else native_objective,
-                history,
-                view["admissible_commands"],
-                service["knowledge"],
-                step_budget - step_index,
-            )
-            try:
-                directive, policy_state = worker.step(policy_view, policy_state)
-            except CandidateExecutionError as error:
-                candidate_error = str(error)
-                break
+            if action_mode == "direct":
+                action_choices = view["admissible_commands"]
+                directive = {
+                    "kind": "model",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You control ALFWorld. Choose one command from the complete list of "
+                                "currently allowed commands. Use the task, observation, recent actions, "
+                                "and reusable knowledge to decide. Output the chosen command exactly, "
+                                "with no explanation."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps({
+                                "task": objective if task else native_objective,
+                                "observation": observation,
+                                "recent_actions": history[-5:],
+                                "allowed_commands": action_choices,
+                                "knowledge": service["knowledge"],
+                                "remaining_steps": step_budget - step_index,
+                            }, ensure_ascii=False),
+                        },
+                    ],
+                }
+                policy_state = {"action_choices": action_choices}
+            else:
+                policy_view = make_policy_view(
+                    observation,
+                    objective if task else native_objective,
+                    history,
+                    view["admissible_commands"],
+                    service["knowledge"],
+                    step_budget - step_index,
+                )
+                try:
+                    directive, policy_state = worker.step(policy_view, policy_state)
+                except CandidateExecutionError as error:
+                    candidate_error = str(error)
+                    break
             action_choices = policy_state.get("action_choices", view["admissible_commands"])
             if not isinstance(action_choices, list) or not all(
                 isinstance(choice, str) for choice in action_choices
@@ -150,13 +188,17 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                 break
             generation = None
             if directive["kind"] == "model":
-                allowed = (
-                    [str(index + 1) for index, choice in enumerate(action_choices)
-                     if choice in view["admissible_commands"]]
-                    if "action_choices" in policy_state else view["admissible_commands"]
-                )
+                if action_mode == "direct":
+                    allowed = action_choices
+                elif "action_choices" in policy_state:
+                    allowed = [str(index + 1) for index, choice in enumerate(action_choices)
+                               if choice in view["admissible_commands"]]
+                else:
+                    allowed = view["admissible_commands"]
                 if not allowed:
-                    candidate_error = "policy has no admissible model action choices"
+                    candidate_error = "Solver has no admissible model action choices" if action_mode == "direct" else (
+                        "policy has no admissible model action choices"
+                    )
                     break
                 generation = model.generate(
                     directive["messages"],
@@ -177,7 +219,8 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                 action_choices,
             )
             if action not in view["admissible_commands"]:
-                candidate_error = "policy action {!r} is not an admissible command".format(selection)
+                label = "Solver action" if action_mode == "direct" else "policy action"
+                candidate_error = "{} {!r} is not an admissible command".format(label, selection)
                 break
             result = env.step(action)
             current_facts = {fact_key(fact) for fact in result["facts"]}
@@ -217,6 +260,7 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                 break
     return {
         "game_file": str(game_file),
+        "action_mode": action_mode,
         "task_id": task.task_id if task else None,
         "objective": objective,
         "initial_observation": initial_observation,

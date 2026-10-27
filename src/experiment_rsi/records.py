@@ -52,7 +52,7 @@ class SyntheticTask:
     hypothesis_id: str = ""
     hypothesis: str = ""
     feedback_refs: List[str] = field(default_factory=list)
-    diagnostic_target: Dict[str, str] = field(default_factory=dict)
+    diagnostic_target: Dict[str, Any] = field(default_factory=dict)
     generation_mode: str = "exploration"
     experiment_spec: Dict[str, Any] = field(default_factory=dict)
 

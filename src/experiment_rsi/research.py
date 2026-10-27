@@ -188,7 +188,12 @@ def _diagnostic_case(result, index, diagnostic_id):
     categories = []
     error = result.get("candidate_error")
     if error:
-        categories.append("invalid_action" if "not an admissible" in error else "policy_error")
+        if "not an admissible" in error:
+            categories.append("invalid_action")
+        elif result.get("action_mode") == "direct":
+            categories.append("solver_error")
+        else:
+            categories.append("policy_error")
     if repeated:
         categories.append("repeated_action")
     if navigation_stalls:
@@ -237,7 +242,9 @@ def summarize_diagnostic_results(results, diagnostic_id, service_path):
         "source": "ALFWorld train cold-start diagnosis",
         "diagnostic_id": diagnostic_id,
         "service_path": str(service_path),
-        "service_version": service_version(load_service(service_path)),
+        "service_version": service_version(
+            json.loads(Path(service_path).read_text(encoding="utf-8"))
+        ),
         "task_count": len(cases),
         "success_count": sum(case["success"] for case in cases),
         "failure_count": len(failures),
