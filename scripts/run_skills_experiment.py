@@ -1,10 +1,12 @@
 """Train the Solver on Designer-generated, planner-verified ALFWorld tasks."""
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import random
 import re
+import uuid
 from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
@@ -13,15 +15,20 @@ from pathlib import Path
 from experiment_rsi.alfworld import AlfworldEpisode, list_game_files
 from experiment_rsi.config import load_config
 from experiment_rsi.constructed import _parse_spec
-from experiment_rsi.evaluation import run_episode
+from experiment_rsi.evaluation import TASK_LINE, run_episode
 from experiment_rsi.model import ModelSession, seed_everything
 from experiment_rsi.records import SyntheticTask
 from experiment_rsi.scene_builder import build_scene, inspect_scene
 from experiment_rsi.solver_sft import collect_solver_sft_examples, train_solver_sft
+from experiment_rsi.synthetic_world import build_synthetic_world, synthetic_world_messages
 from experiment_rsi.synthesis import (
     goal_reached, pddl_goal_expression, replay_witness, source_scene_id,
     supported_placement_game, write_tasks,
 )
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def write_json(path, value):
@@ -127,6 +134,7 @@ def worker_generate(job):
         temperature=_CONFIG["model"]["temperature"],
         top_p=_CONFIG["model"]["top_p"],
         use_adapter=False,
+        enable_thinking=False,
     )
     return result["generated_text"]
 
@@ -242,7 +250,7 @@ def plan_task(config, scene, spec, experiment_id):
                 for item in scene["placements"]
             ]
         },
-        generation_mode="constructed", experiment_spec=spec,
+        generation_mode=scene.get("generation_mode", "constructed"), experiment_spec=spec,
     )
     replay = replay_witness(config, task)
     if not replay["valid"]:
@@ -250,47 +258,109 @@ def plan_task(config, scene, spec, experiment_id):
     return task, replay
 
 
-def design_tasks(executor, config, feedback, entries, output, period, attempts):
-    pending = list(range(len(entries)))
+def design_tasks(executor, config, feedback, entries, output, period, attempts, synthetic_logic_dir=None,
+                 prior_tasks=(), start_index=0, minimum_tasks=None, resume=False):
+    required_tasks = len(entries) if minimum_tasks is None else minimum_tasks
+    if required_tasks < 1 or required_tasks > len(entries):
+        raise ValueError("minimum_tasks must be between 1 and the requested task count")
     accepted = {}
     revision_feedback = {}
+    attempts_done = {}
+    attempt_path = Path(output) / "task_attempts.jsonl"
     records = []
-    for attempt in range(attempts):
+    if resume and attempt_path.is_file():
+        with attempt_path.open(encoding="utf-8") as stream:
+            records = [json.loads(line) for line in stream if line.strip()]
+        for record in records:
+            index = record["slot_index"]
+            attempts_done[index] = max(attempts_done.get(index, 0), record["attempt"])
+            if record.get("task"):
+                accepted[index] = SyntheticTask(**record["task"])
+            elif record.get("rejection_reason"):
+                revision_feedback[index] = {
+                    "output": record["output"],
+                    "reason": (
+                        "The previous proposal was rejected: {}. Correct the task specification and "
+                        "keep it tied to a cited Solver failure."
+                    ).format(record["rejection_reason"]),
+                }
+    accepted_worlds = {task.task_id for task in prior_tasks} if synthetic_logic_dir else set()
+    if synthetic_logic_dir:
+        accepted_worlds.update(task.task_id for task in accepted.values())
+    while True:
+        pending = [index for index in range(len(entries))
+                   if index not in accepted and attempts_done.get(index, 0) < attempts]
         if not pending:
             break
         jobs = []
+        attempt_numbers = {index: attempts_done.get(index, 0) + 1 for index in pending}
         for index in pending:
-            messages = designer_task_messages(entries[index]["game"], feedback)
+            messages = (synthetic_world_messages(feedback) if synthetic_logic_dir else
+                        designer_task_messages(entries[index]["game"], feedback))
+            if synthetic_logic_dir and feedback["cases"]:
+                case = feedback["cases"][(index + start_index) % len(feedback["cases"])]
+                messages.append({"role": "user", "content":
+                                 "Focus this task on the diagnosed failure {}: {}".format(
+                                     case["ref"], json.dumps(case, ensure_ascii=False))})
+            if synthetic_logic_dir and (prior_tasks or accepted):
+                existing = [task.experiment_spec for task in [*prior_tasks, *accepted.values()]]
+                worlds = [{"receptacles": spec["receptacles"], "objects": spec["objects"]}
+                          for spec in existing]
+                messages.append({"role": "user", "content":
+                                 "Generate a world different from these already accepted worlds: "
+                                 + json.dumps(worlds, ensure_ascii=False)})
             if index in revision_feedback:
-                messages.append({"role": "user", "content": revision_feedback[index]})
+                previous = revision_feedback[index]
+                if synthetic_logic_dir:
+                    messages.append({"role": "assistant", "content": previous["output"]})
+                messages.append({"role": "user", "content": previous["reason"]})
             jobs.append({
                 "messages": messages,
-                "seed": config["run"]["seed"] + period * 1000 + attempt * 100 + index,
-                "max_new_tokens": 768,
+                "seed": (config["run"]["seed"] + period * 1000 +
+                         (attempt_numbers[index] - 1) * 100 + index + start_index),
+                "max_new_tokens": 1536,
             })
-        outputs = list(executor.map(worker_generate, jobs))
-        remaining = []
-        attempt_records = []
+        outputs = executor.map(worker_generate, jobs)
         for index, job, output_text in zip(pending, jobs, outputs):
-            experiment_id = "period-{:02d}/task-{:02d}".format(period, index + 1)
+            attempt_number = attempt_numbers[index]
+            experiment_id = "period-{:02d}/task-{:02d}".format(period, index + start_index + 1)
             record = {
                 "experiment_id": experiment_id,
+                "slot_index": index,
                 "source_scene_id": entries[index]["scene"],
-                "attempt": attempt + 1,
+                "attempt": attempt_number,
                 "prompt": job["messages"],
                 "output": output_text,
             }
             try:
                 spec = _parse_spec(output_text, feedback)
-                scene = build_scene(entries[index]["game"], spec, output / "task_games")
+                if synthetic_logic_dir:
+                    world_spec = {"receptacles": sorted(x.lower() for x in spec["receptacles"]),
+                                  "objects": sorted(spec["objects"], key=lambda item: item["type"].lower())}
+                    world_id = hashlib.sha256(json.dumps(world_spec, sort_keys=True).encode()).hexdigest()[:16]
+                    if world_id in accepted_worlds:
+                        raise ValueError("this synthetic world duplicates a previously accepted task")
+                    scene = build_synthetic_world(
+                        spec, output / "task_games" / "{}-{}-{}-{}".format(
+                            index + 1, attempt_number, world_id, uuid.uuid4().hex[:8]),
+                        synthetic_logic_dir,
+                    )
+                    scene.update({"task_id": world_id, "source_game_file": "",
+                                  "source_scene_id": "synthetic-" + world_id,
+                                  "source_goal_text": "", "generation_mode": "synthetic",
+                                  "placements": [{"object_type": item["type"], "count": item["count"],
+                                                  "destination_type": item["destination_receptacle"]}
+                                                 for item in spec["objects"]]})
+                else:
+                    scene = build_scene(entries[index]["game"], spec, output / "task_games")
                 task, replay = plan_task(config, scene, spec, experiment_id)
             except (json.JSONDecodeError, ValueError, KeyError, TypeError) as error:
-                revision_feedback[index] = (
+                reason = (
                     "The previous proposal was rejected: {}. Correct the task specification and "
                     "keep it tied to a cited Solver failure."
                 ).format(error)
+                revision_feedback[index] = {"output": output_text, "reason": reason}
                 record["rejection_reason"] = str(error)
-                remaining.append(index)
             else:
                 record.update({
                     "spec": spec,
@@ -300,20 +370,20 @@ def design_tasks(executor, config, feedback, entries, output, period, attempts):
                 })
                 record["rejection_reason"] = None
                 accepted[index] = task
-            attempt_records.append(record)
-        records.extend(attempt_records)
-        for record in attempt_records:
+                if synthetic_logic_dir:
+                    accepted_worlds.add(world_id)
+            records.append(record)
             log("period {} {} attempt {}: {}".format(
                 period, record["experiment_id"], record["attempt"],
                 record.get("rejection_reason") or "planner and replay verified"))
-        write_jsonl(output / "task_attempts.jsonl", records)
-        pending = remaining
+            attempts_done[index] = attempt_number
+            write_jsonl(output / "task_attempts.jsonl", records)
     tasks = [accepted[index] for index in sorted(accepted)]
     write_tasks(output / "tasks.jsonl", tasks)
-    if len(tasks) != len(entries):
+    if len(tasks) < required_tasks:
         raise RuntimeError(
-            "Designer produced {} planner-verified tasks out of {}; see task_attempts.jsonl".format(
-                len(tasks), len(entries)
+            "Designer produced {} planner-verified tasks; at least {} required out of {}; see task_attempts.jsonl".format(
+                len(tasks), required_tasks, len(entries)
             )
         )
     return tasks
@@ -327,6 +397,12 @@ def _short(value, limit):
 def summarize_diagnostics(results, diagnostic_id, adapter_path):
     cases = []
     for index, result in enumerate(results):
+        objective = result.get("objective")
+        if not objective:
+            task_line = TASK_LINE.search(result["initial_observation"])
+            if not task_line:
+                raise ValueError("ALFWorld diagnostic observation is missing its task objective")
+            objective = task_line.group(0)
         trace = result["trace"]
         seen = set()
         repeated = 0
@@ -349,7 +425,7 @@ def summarize_diagnostics(results, diagnostic_id, adapter_path):
         cases.append({
             "ref": "{}/episode-{:03d}".format(diagnostic_id, index),
             "scene_id": result["source_scene_id"],
-            "objective": _short(result.get("initial_observation"), 180),
+            "objective": objective,
             "success": bool(result["success"]),
             "goal_progress": result.get("goal_progress"),
             "steps": result["steps"],
@@ -385,19 +461,34 @@ def summarize_diagnostics(results, diagnostic_id, adapter_path):
     }
 
 
-def prepare_period(executor, config, adapter_path, allocation, output, period, attempts):
+def prepare_period(executor, config, adapter_path, allocation, output, period, attempts, synthetic_logic_dir=None,
+                   prior_tasks=(), start_index=0, minimum_tasks=None, resume=False):
     period_dir = output / "period-{:02d}".format(period)
-    period_dir.mkdir()
-    write_json(period_dir / "solver_parent.json", {"adapter": str(adapter_path) if adapter_path else "base"})
-    diagnostic_entries = [{**entry, "split": "train"} for entry in allocation["diagnostic"]]
-    diagnostic = evaluate(executor, diagnostic_entries, 50000 + period * 1000)
-    write_jsonl(period_dir / "diagnostic_episodes.jsonl", diagnostic["results"])
-    feedback = summarize_diagnostics(
-        diagnostic["results"], "period-{:02d}-diagnostic".format(period), adapter_path
-    )
-    write_json(period_dir / "diagnostic_feedback.json", feedback)
+    period_dir.mkdir(exist_ok=resume)
+    parent_file = period_dir / "solver_parent.json"
+    parent = {"adapter": str(adapter_path) if adapter_path else "base"}
+    if parent_file.is_file() and read_json(parent_file) != parent:
+        raise ValueError("saved period was prepared with a different Solver adapter")
+    write_json(parent_file, parent)
+    episodes_file = period_dir / "diagnostic_episodes.jsonl"
+    feedback_file = period_dir / "diagnostic_feedback.json"
+    if episodes_file.is_file():
+        with episodes_file.open(encoding="utf-8") as stream:
+            diagnostic_results = [json.loads(line) for line in stream if line.strip()]
+        successes = sum(result["success"] for result in diagnostic_results)
+        diagnostic = {"results": diagnostic_results, "success_rate": successes / len(diagnostic_results)}
+    else:
+        diagnostic_entries = [{**entry, "split": "train"} for entry in allocation["diagnostic"]]
+        diagnostic = evaluate(executor, diagnostic_entries, 50000 + period * 1000)
+        diagnostic_results = diagnostic["results"]
+        write_jsonl(episodes_file, diagnostic_results)
+    feedback = (read_json(feedback_file) if feedback_file.is_file() else
+                summarize_diagnostics(diagnostic_results,
+                                      "period-{:02d}-diagnostic".format(period), adapter_path))
+    write_json(feedback_file, feedback)
     tasks = design_tasks(
-        executor, config, feedback, allocation["tasks"], period_dir, period, attempts
+        executor, config, feedback, allocation["tasks"], period_dir, period, attempts, synthetic_logic_dir,
+        prior_tasks=prior_tasks, start_index=start_index, minimum_tasks=minimum_tasks, resume=resume,
     )
     examples = collect_solver_sft_examples(config, tasks)
     write_jsonl(period_dir / "solver_sft.jsonl", examples)
@@ -425,6 +516,7 @@ def main():
     parser.add_argument("--gpus", type=int, default=2)
     parser.add_argument("--train-device", default="cuda:0")
     parser.add_argument("--manifest")
+    parser.add_argument("--synthetic-logic-dir", help="generate new worlds from ALFWorld rules")
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     if args.attempts < 1 or args.gpus < 1:
@@ -434,6 +526,10 @@ def main():
     manifest = (json.loads(Path(args.manifest).read_text(encoding="utf-8")) if args.manifest else
                 make_manifest(config, args.periods, args.diagnostics, args.tasks,
                               args.id_test, args.ood_test))
+    if args.synthetic_logic_dir:
+        for period_index, allocation in enumerate(manifest["periods"]):
+            allocation["tasks"] = [{"scene": "synthetic-slot-{}-{}".format(period_index + 1, i + 1)}
+                                   for i in range(args.tasks)]
     output = Path(args.out).resolve()
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "manifest.json", manifest)
@@ -458,7 +554,8 @@ def main():
         initial_ood = evaluate(executor, manifest["ood_test"], 920000)
         write_json(output / "initial_test.json", {"id": initial_id, "ood": initial_ood})
         first_dir, tasks, examples, diagnostic = prepare_period(
-            executor, config, None, manifest["periods"][0], output, 1, args.attempts
+            executor, config, None, manifest["periods"][0], output, 1, args.attempts,
+            args.synthetic_logic_dir,
         )
 
     period_summaries = []
@@ -505,7 +602,7 @@ def main():
             if period < len(manifest["periods"]):
                 prepared = prepare_period(
                     executor, config, current_adapter, manifest["periods"][period],
-                    output, period + 1, args.attempts,
+                    output, period + 1, args.attempts, args.synthetic_logic_dir,
                 )
 
     final_id = json.loads((output / "period-{:02d}".format(len(period_summaries)) /

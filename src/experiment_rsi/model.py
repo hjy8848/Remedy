@@ -77,16 +77,18 @@ class ModelSession:
         self.adapter_version = str(adapter_path) if adapter_path else ("trainable-new" if trainable else "base")
         self.has_adapter = adapter_path is not None or trainable
 
-    def encode_messages(self, messages):
+    def encode_messages(self, messages, enable_thinking=None):
+        template_options = {} if enable_thinking is None else {"enable_thinking": enable_thinking}
         encoded = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt", return_dict=False
+            messages, add_generation_prompt=True, return_tensors="pt", return_dict=False,
+            **template_options,
         )
         return encoded.to(self.device)
 
     def generate(self, messages, max_new_tokens, temperature, top_p, allowed_texts=None,
-                 use_adapter=True):
+                 use_adapter=True, enable_thinking=None):
         torch = self.torch
-        prompt_ids = self.encode_messages(messages)
+        prompt_ids = self.encode_messages(messages, enable_thinking=enable_thinking)
         self.model.eval()
         sampling = {
             "max_new_tokens": max_new_tokens,

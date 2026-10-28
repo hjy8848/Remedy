@@ -91,12 +91,14 @@ def train_solver_sft(config, dataset_path, output_dir, parent_adapter=None, devi
         def __getitem__(self, index):
             example = examples[index]
             prompt_ids = tokenizer.apply_chat_template(
-                example["messages"], tokenize=True, add_generation_prompt=True
+                example["messages"], tokenize=True, add_generation_prompt=True,
+                enable_thinking=False,
             )
             full_ids = tokenizer.apply_chat_template(
                 example["messages"] + [{"role": "assistant", "content": example["target_action"]}],
                 tokenize=True,
                 add_generation_prompt=False,
+                enable_thinking=False,
             )
             if full_ids[:len(prompt_ids)] != prompt_ids:
                 raise ValueError("chat template changed the inference prompt before its target action")

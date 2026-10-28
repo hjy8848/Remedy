@@ -217,6 +217,7 @@ def run_episode(config, service, model, game_file, task=None, max_steps=None, se
                     temperature=config["model"]["temperature"],
                     top_p=config["model"]["top_p"],
                     allowed_texts=allowed,
+                    enable_thinking=False if action_mode == "direct" else None,
                 )
                 selection = generation["generated_text"].strip()
             else:
